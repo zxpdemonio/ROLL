@@ -15,6 +15,7 @@ import numpy as np
 import ray
 import tensordict
 import torch
+from codetiming import Timer
 from tensordict import TensorDict
 from torch.utils.data import DataLoader
 
@@ -28,6 +29,23 @@ POST_GENERATE_DROP_NON_TENSOR_KEYS: tuple[str, ...] = (
     "multi_modal_data",
     "mm_refs",
 )
+
+TRANSFER_TIME_SERIALIZE_KEY = "transfer/time/serialize"
+TRANSFER_TIME_PUT_KEY = "transfer/time/put"
+TRANSFER_TIME_GET_KEY = "transfer/time/get"
+TRANSFER_TIME_DESERIALIZE_KEY = "transfer/time/deserialize"
+TRANSFER_BYTES_TOTAL_KEY = "transfer/bytes/total"
+TRANSFER_BYTES_TENSOR_KEY = "transfer/bytes/tensor"
+TRANSFER_BYTES_STRING_KEY = "transfer/bytes/string"
+TRANSFER_BYTES_OBJECT_KEY = "transfer/bytes/object"
+TRANSFER_BYTES_MULTIMODAL_BEFORE_KEY = "transfer/bytes/multimodal_before_strip"
+TRANSFER_BYTES_MULTIMODAL_AFTER_KEY = "transfer/bytes/multimodal_after_strip"
+TRANSFER_SAMPLE_COUNT_KEY = "transfer/sample_count"
+TRANSFER_SEQUENCE_LENGTH_MEAN_KEY = "transfer/sequence_length/mean"
+TRANSFER_SEQUENCE_LENGTH_MAX_KEY = "transfer/sequence_length/max"
+TRANSFER_STAGE_KEY = "transfer/stage"
+TRANSFER_BACKEND_KEY = "transfer/backend"
+TRANSFER_PROTOCOL_KEY = "transfer/protocol"
 
 TRANSFER_MASK_DTYPES: dict[str, torch.dtype] = {
     "attention_mask": torch.uint8,
@@ -168,6 +186,95 @@ def _append_buffer_chunk(chunks: list[bytes], payload: bytes) -> tuple[int, int]
     offset = sum(len(chunk) for chunk in chunks)
     chunks.append(payload)
     return offset, len(payload)
+
+
+def _safe_float(value: Any) -> float:
+    return float(value) if value is not None else 0.0
+
+
+def _estimate_multimodal_bytes(values: np.ndarray) -> int:
+    total = 0
+    for item in values.tolist():
+        total += len(pickle.dumps(item, protocol=5))
+    return total
+
+
+def _get_sequence_length_metrics(batch: Optional[TensorDict]) -> dict[str, float]:
+    if batch is None:
+        return {
+            TRANSFER_SEQUENCE_LENGTH_MEAN_KEY: 0.0,
+            TRANSFER_SEQUENCE_LENGTH_MAX_KEY: 0.0,
+        }
+    for key in ("input_ids", "responses", "attention_mask"):
+        if key in batch.keys() and batch[key].ndim >= 2:
+            lengths = batch[key].shape[-1]
+            return {
+                TRANSFER_SEQUENCE_LENGTH_MEAN_KEY: float(lengths),
+                TRANSFER_SEQUENCE_LENGTH_MAX_KEY: float(lengths),
+            }
+    return {
+        TRANSFER_SEQUENCE_LENGTH_MEAN_KEY: 0.0,
+        TRANSFER_SEQUENCE_LENGTH_MAX_KEY: 0.0,
+    }
+
+
+def _validate_transfer_stage(data: "DataProto", stage: str) -> None:
+    if stage == "post_generate" and "multi_modal_data" in data.non_tensor_batch:
+        raise ValueError("post_generate transfer payload must not include raw multi_modal_data")
+
+
+def _validate_transfer_payload(payload: dict[str, Any]) -> None:
+    if payload.get("protocol") != "v1":
+        return
+    required_keys = {"meta_bytes", "bulk_buffer", "buffer_specs"}
+    missing_keys = required_keys - set(payload.keys())
+    if missing_keys:
+        raise ValueError(f"Transfer payload missing keys: {sorted(missing_keys)}")
+
+
+def _collect_transfer_stats(
+    *,
+    stage: str,
+    protocol: str,
+    backend: str,
+    batch: Optional[TensorDict],
+    non_tensor_batch: dict[str, np.ndarray],
+    buffer_specs: Optional[list[dict[str, Any]]] = None,
+    payload: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    tensor_bytes = 0
+    string_bytes = 0
+    object_bytes = 0
+    if buffer_specs is not None:
+        for spec in buffer_specs:
+            if spec["section"] == "batch":
+                tensor_bytes += spec["nbytes"]
+                continue
+            codec = spec["codec"]
+            if codec == "string_array":
+                string_bytes += spec["nbytes"] + spec["offsets_nbytes"]
+            elif codec == "pickle_object_array":
+                object_bytes += spec["nbytes"]
+            else:
+                object_bytes += spec["nbytes"]
+    total_bytes = 0
+    if payload is not None:
+        total_bytes = len(payload.get("meta_bytes", b"")) + len(payload.get("bulk_buffer", b""))
+    multimodal_after = _estimate_multimodal_bytes(non_tensor_batch["multi_modal_data"]) if "multi_modal_data" in non_tensor_batch else 0
+    sequence_metrics = _get_sequence_length_metrics(batch)
+    sample_count = int(batch.batch_size[0]) if batch is not None else int(len(next(iter(non_tensor_batch.values())))) if non_tensor_batch else 0
+    return {
+        TRANSFER_STAGE_KEY: stage,
+        TRANSFER_BACKEND_KEY: backend,
+        TRANSFER_PROTOCOL_KEY: protocol,
+        TRANSFER_BYTES_TOTAL_KEY: total_bytes,
+        TRANSFER_BYTES_TENSOR_KEY: tensor_bytes,
+        TRANSFER_BYTES_STRING_KEY: string_bytes,
+        TRANSFER_BYTES_OBJECT_KEY: object_bytes,
+        TRANSFER_BYTES_MULTIMODAL_AFTER_KEY: multimodal_after,
+        TRANSFER_SAMPLE_COUNT_KEY: sample_count,
+        **sequence_metrics,
+    }
 
 
 def _encode_tensor_field(name: str, tensor: torch.Tensor, chunks: list[bytes]) -> dict[str, Any]:
@@ -567,7 +674,10 @@ class DataProto:
         if protocol != "v1":
             raise ValueError(f"Unsupported transfer protocol: {protocol}")
 
+        multimodal_before = _estimate_multimodal_bytes(self.non_tensor_batch["multi_modal_data"]) if "multi_modal_data" in self.non_tensor_batch else 0
         trimmed = self.trim_for_stage(stage)
+        if self.meta_info.get("rollout_transfer_debug_validate", False):
+            _validate_transfer_stage(trimmed, stage)
         chunks: list[bytes] = []
         buffer_specs: list[dict[str, Any]] = []
 
@@ -587,12 +697,28 @@ class DataProto:
             protocol=5,
         )
         bulk_buffer = b"".join(chunks)
-        return {
+        payload = {
             "protocol": "v1",
             "meta_bytes": meta_bytes,
             "bulk_buffer": bulk_buffer,
             "buffer_specs": buffer_specs,
         }
+        if trimmed.meta_info.get("rollout_transfer_metrics_enabled", False):
+            payload["transfer_stats"] = {
+                **_collect_transfer_stats(
+                    stage=stage,
+                    protocol=protocol,
+                    backend="protocol",
+                    batch=trimmed.batch,
+                    non_tensor_batch=trimmed.non_tensor_batch,
+                    buffer_specs=buffer_specs,
+                    payload=payload,
+                ),
+                TRANSFER_BYTES_MULTIMODAL_BEFORE_KEY: multimodal_before,
+            }
+        if trimmed.meta_info.get("rollout_transfer_debug_validate", False):
+            _validate_transfer_payload(payload)
+        return payload
 
     @classmethod
     def from_transfer_payload(cls, payload: dict[str, Any]) -> "DataProto":
@@ -603,7 +729,11 @@ class DataProto:
         if protocol != "v1":
             raise ValueError(f"Unsupported transfer protocol: {protocol}")
 
+        if payload.get("transfer_stats") is not None and payload.get("meta_bytes") is not None:
+            pass
         metadata = pickle.loads(payload["meta_bytes"])
+        if metadata["meta_info"].get("rollout_transfer_debug_validate", False):
+            _validate_transfer_payload(payload)
         buffer = memoryview(payload["bulk_buffer"])
 
         tensors: dict[str, torch.Tensor] = {}
@@ -1107,11 +1237,19 @@ class RolloutTransferHandle:
     stage: str
     payload: Optional[dict[str, Any]] = None
     obj_ref: Optional[ray.ObjectRef] = None
+    stats: Dict[str, Any] = field(default_factory=dict)
 
 
 class RolloutTransferBackend:
     def __init__(self, protocol: str):
         self.protocol = protocol
+
+    @staticmethod
+    def _maybe_record_transfer_metrics(data: DataProto, stats: Optional[dict[str, Any]]) -> None:
+        if not stats or not data.meta_info.get("rollout_transfer_metrics_enabled", False):
+            return
+        metrics = data.meta_info.setdefault("metrics", {})
+        metrics.update(stats)
 
     def put(self, data: DataProto, stage: str) -> RolloutTransferHandle:
         raise NotImplementedError
@@ -1130,11 +1268,18 @@ class LegacyRolloutTransferBackend(RolloutTransferBackend):
             protocol="legacy",
             stage=stage,
             payload=data.to_transfer_payload(stage=stage, protocol="legacy"),
+            stats={
+                TRANSFER_STAGE_KEY: stage,
+                TRANSFER_BACKEND_KEY: "legacy",
+                TRANSFER_PROTOCOL_KEY: "legacy",
+            },
         )
 
     def get(self, handle: RolloutTransferHandle) -> DataProto:
         assert handle.payload is not None, "legacy transfer handle requires inline payload"
-        return DataProto.from_transfer_payload(handle.payload)
+        data = DataProto.from_transfer_payload(handle.payload)
+        self._maybe_record_transfer_metrics(data, handle.stats)
+        return data
 
 
 class RayOptimizedRolloutTransferBackend(RolloutTransferBackend):
@@ -1144,18 +1289,41 @@ class RayOptimizedRolloutTransferBackend(RolloutTransferBackend):
         super().__init__(protocol=protocol)
 
     def put(self, data: DataProto, stage: str) -> RolloutTransferHandle:
-        payload = data.to_transfer_payload(stage=stage, protocol=self.protocol)
+        with Timer(logger=None) as serialize_timer:
+            payload = data.to_transfer_payload(stage=stage, protocol=self.protocol)
+        with Timer(logger=None) as put_timer:
+            obj_ref = ray.put(payload)
+        stats = dict(payload.get("transfer_stats", {}))
+        if data.meta_info.get("rollout_transfer_metrics_enabled", False):
+            stats.update(
+                {
+                    TRANSFER_STAGE_KEY: stage,
+                    TRANSFER_BACKEND_KEY: "ray_optimized",
+                    TRANSFER_PROTOCOL_KEY: self.protocol,
+                    TRANSFER_TIME_SERIALIZE_KEY: _safe_float(serialize_timer.last),
+                    TRANSFER_TIME_PUT_KEY: _safe_float(put_timer.last),
+                }
+            )
         return RolloutTransferHandle(
             backend="ray_optimized",
             protocol=self.protocol,
             stage=stage,
-            obj_ref=ray.put(payload),
+            obj_ref=obj_ref,
+            stats=stats,
         )
 
     def get(self, handle: RolloutTransferHandle) -> DataProto:
         assert handle.obj_ref is not None, "ray_optimized transfer handle requires object ref"
-        payload = ray.get(handle.obj_ref)
-        return DataProto.from_transfer_payload(payload)
+        with Timer(logger=None) as get_timer:
+            payload = ray.get(handle.obj_ref)
+        with Timer(logger=None) as deserialize_timer:
+            data = DataProto.from_transfer_payload(payload)
+        if data.meta_info.get("rollout_transfer_metrics_enabled", False):
+            stats = dict(handle.stats)
+            stats[TRANSFER_TIME_GET_KEY] = _safe_float(get_timer.last)
+            stats[TRANSFER_TIME_DESERIALIZE_KEY] = _safe_float(deserialize_timer.last)
+            self._maybe_record_transfer_metrics(data, stats)
+        return data
 
 
 def get_rollout_transfer_backend(backend_name: str, protocol: str) -> RolloutTransferBackend:

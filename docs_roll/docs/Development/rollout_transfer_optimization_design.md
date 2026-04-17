@@ -340,6 +340,8 @@ Add a rollout transfer backend abstraction with a common API:
 - `get(handle)`
 - `cleanup(handle)`
 
+The first implementation also allows backend-owned transfer metrics and validation hooks, but these hooks must operate on the ROLL transfer payload layer rather than on Ray serializer internals.
+
 ### Backend modes
 
 #### 1. `legacy`
@@ -600,6 +602,14 @@ Canonical stage names:
 
 This allows gradual rollout, A/B comparisons, and reuse of the same stage vocabulary across semantic trimming, protocol encoding, and backend integration.
 
+Recommended enable order:
+
+1. `rollout_transfer_backend=legacy`
+2. `rollout_transfer_protocol=v1`
+3. `rollout_transfer_metrics_enabled=true`
+4. `rollout_transfer_debug_validate=true` in dev/test only
+5. switch selected heavy paths to `rollout_transfer_backend=ray_optimized`
+
 ---
 
 ## Recommended Implementation Order
@@ -721,6 +731,18 @@ Add lightweight profiling hooks or timers in the transfer path and emit structur
 - `transfer/bytes/object`
 - `transfer/bytes/multimodal_before_strip`
 - `transfer/bytes/multimodal_after_strip`
+- `transfer/sample_count`
+- `transfer/sequence_length/mean`
+- `transfer/sequence_length/max`
+- `transfer/stage`
+- `transfer/backend`
+- `transfer/protocol`
+
+When `rollout_transfer_debug_validate=true`, validation should fail explicitly on malformed internal states such as:
+
+- `post_generate` payloads still carrying raw `multi_modal_data`
+- missing required transfer payload keys
+- malformed encoded payload layout
 
 ### Deliverable
 

@@ -62,3 +62,29 @@ def test_ray_optimized_rollout_transfer_backend_round_trip() -> None:
         assert restored.meta_info == proto.meta_info
     finally:
         ray.shutdown()
+
+
+def test_ray_optimized_rollout_transfer_backend_emits_metrics() -> None:
+    ray.init(local_mode=True, ignore_reinit_error=True)
+    try:
+        proto = DataProto.from_dict(
+            tensors={"input_ids": torch.arange(6, dtype=torch.long).reshape(2, 3)},
+            non_tensors={"domain": ["math", "code"]},
+            meta_info={"rollout_transfer_metrics_enabled": True},
+        )
+
+        backend = get_rollout_transfer_backend("ray_optimized", "v1")
+        handle = backend.put(proto, stage="post_generate")
+        restored = backend.get(handle)
+
+        metrics = restored.meta_info["metrics"]
+        assert metrics["transfer/backend"] == "ray_optimized"
+        assert metrics["transfer/protocol"] == "v1"
+        assert metrics["transfer/stage"] == "post_generate"
+        assert metrics["transfer/time/serialize"] >= 0
+        assert metrics["transfer/time/put"] >= 0
+        assert metrics["transfer/time/get"] >= 0
+        assert metrics["transfer/time/deserialize"] >= 0
+        assert metrics["transfer/bytes/total"] > 0
+    finally:
+        ray.shutdown()

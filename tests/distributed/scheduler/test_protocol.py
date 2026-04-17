@@ -307,6 +307,36 @@ def test_transfer_payload_legacy_round_trip_returns_clone() -> None:
     assert restored.meta_info == proto.meta_info
 
 
+def test_transfer_payload_v1_emits_metrics_when_enabled() -> None:
+    proto = DataProto.from_dict(
+        tensors={"input_ids": torch.arange(6, dtype=torch.long).reshape(2, 3)},
+        non_tensors={"domain": ["math", "code"]},
+        meta_info={"rollout_transfer_metrics_enabled": True},
+    )
+
+    payload = proto.to_transfer_payload(stage="generate_request", protocol="v1")
+
+    stats = payload["transfer_stats"]
+    assert stats["transfer/stage"] == "generate_request"
+    assert stats["transfer/protocol"] == "v1"
+    assert stats["transfer/backend"] == "protocol"
+    assert stats["transfer/bytes/total"] > 0
+    assert stats["transfer/sample_count"] == 2
+
+
+def test_transfer_payload_v1_debug_validate_rejects_missing_required_keys() -> None:
+    proto = DataProto.from_dict(
+        tensors={"input_ids": torch.ones((1, 3), dtype=torch.long)},
+        meta_info={"rollout_transfer_debug_validate": True},
+    )
+
+    payload = proto.to_transfer_payload(stage="generate_request", protocol="v1")
+    payload.pop("bulk_buffer")
+
+    with pytest.raises(ValueError, match="Transfer payload missing keys"):
+        DataProto.from_transfer_payload(payload)
+
+
 def test_clone_independence(create_data_proto):
     """Test that clone() returns an independent copy with the same content."""
     dp = create_data_proto
