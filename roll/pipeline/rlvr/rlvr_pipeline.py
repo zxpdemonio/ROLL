@@ -23,7 +23,7 @@ from roll.distributed.executor.cluster import Cluster
 from roll.configs.base_config import RouterArguments
 from roll.distributed.scheduler.generate_scheduler import DynamicSamplingScheduler
 from roll.distributed.scheduler.router import RouterManager
-from roll.distributed.scheduler.protocol import DataProto
+from roll.distributed.scheduler.protocol import DataProto, materialize_rollout_transfer
 from roll.models.model_providers import default_tokenizer_provider
 from roll.pipeline.base_pipeline import BasePipeline
 from roll.utils.constants import RAY_NAMESPACE
@@ -513,7 +513,11 @@ class RLVRPipeline(BasePipeline):
                             data=batch, global_step=global_step, batch_size=self.domain_batch_size[domain]
                         )
                     for domain, scheduler_ref in scheduler_refs.items():
-                        domain_batch: DataProto = ray.get(scheduler_ref, timeout=self.pipeline_config.rpc_timeout)
+                        domain_batch = materialize_rollout_transfer(
+                            handle=ray.get(scheduler_ref, timeout=self.pipeline_config.rpc_timeout),
+                            backend_name=self.pipeline_config.rollout_transfer_backend,
+                            protocol=self.pipeline_config.rollout_transfer_protocol,
+                        )
                         metrics_mgr.add_domain_metrics(
                             domain, reduce_metrics(domain_batch.meta_info.pop("metrics", {}))
                         )
@@ -587,7 +591,11 @@ class RLVRPipeline(BasePipeline):
                             )
                             metrics_mgr.add_metrics(dynamic_batching_metrics)
                         old_log_probs_refs: List[ray.ObjectRef] = self.actor_train.compute_log_probs(batch, blocking=False)
-                        old_log_probs = DataProto.materialize_concat(data_refs=old_log_probs_refs)
+                        old_log_probs = DataProto.materialize_concat(
+                            data_refs=old_log_probs_refs,
+                            transfer_backend=self.pipeline_config.rollout_transfer_backend,
+                            transfer_protocol=self.pipeline_config.rollout_transfer_protocol,
+                        )
 
                         # Customize_logging metrics, Double check call twice
                         if self.pipeline_config.save_logging_board_dir:
@@ -612,7 +620,11 @@ class RLVRPipeline(BasePipeline):
                         batch.batch["old_log_probs"] = torch.zeros_like(batch.batch["attention_mask"][:, 1:])
 
                     if self.pipeline_config.adv_estimator == "gae":
-                        values = DataProto.materialize_concat(data_refs=values_refs)
+                        values = DataProto.materialize_concat(
+                            data_refs=values_refs,
+                            transfer_backend=self.pipeline_config.rollout_transfer_backend,
+                            transfer_protocol=self.pipeline_config.rollout_transfer_protocol,
+                        )
                         batch = batch.union(values)
                         metrics_mgr.add_reduced_metrics(values.meta_info.pop("metrics", {}))
 
@@ -799,9 +811,13 @@ class RLVRPipeline(BasePipeline):
                 "global_step": global_step,
             }
 
-            generate_output: DataProto = ray.get(
-                self.val_generate_scheduler.get_batch.remote(data=batch, global_step=global_step, batch_size=len(self.val_dataset)),
-                timeout=self.pipeline_config.rpc_timeout,
+            generate_output = materialize_rollout_transfer(
+                handle=ray.get(
+                    self.val_generate_scheduler.get_batch.remote(data=batch, global_step=global_step, batch_size=len(self.val_dataset)),
+                    timeout=self.pipeline_config.rpc_timeout,
+                ),
+                backend_name=self.pipeline_config.rollout_transfer_backend,
+                protocol=self.pipeline_config.rollout_transfer_protocol,
             )
 
             generate_output.meta_info.pop("is_offload_states", None)

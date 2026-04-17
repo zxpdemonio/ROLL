@@ -18,7 +18,12 @@ from transformers import set_seed
 
 from roll.distributed.executor.cluster import Cluster
 from roll.distributed.scheduler.router import RouterManager
-from roll.distributed.scheduler.protocol import DataProto, pad_dataproto_to_divisor, unpad_dataproto
+from roll.distributed.scheduler.protocol import (
+    DataProto,
+    get_rollout_transfer_backend,
+    pad_dataproto_to_divisor,
+    unpad_dataproto,
+)
 from roll.distributed.scheduler.reward_scheduler import RewardScheduler
 from roll.distributed.scheduler.rollout_mock_mixin import RolloutMockMixin
 from roll.models.model_providers import default_tokenizer_provider, default_processor_provider
@@ -551,6 +556,10 @@ class DynamicSamplingScheduler(RolloutMockMixin):
         self.udrl = udrl_cls()
 
         self.reward_scheduler = RewardScheduler()
+        self.rollout_transfer_backend = get_rollout_transfer_backend(
+            backend_name=self.pipeline_config.rollout_transfer_backend,
+            protocol=self.pipeline_config.rollout_transfer_protocol,
+        )
 
     async def initialize(self):
         await self.router_manager.initialize()
@@ -709,7 +718,9 @@ class DynamicSamplingScheduler(RolloutMockMixin):
         # DUMP MODE: Save merged batch (from mixin)
         await self._maybe_dump_batch(batch, global_step)
 
-        return batch
+        if self.pipeline_config.rollout_transfer_backend == "legacy":
+            return batch
+        return self.rollout_transfer_backend.put(batch, stage="post_generate")
 
     def collect_items_as_batch(self, finished_items: List[ExperienceItem]) -> DataProto:
         collect_data_by_domain = defaultdict(list)

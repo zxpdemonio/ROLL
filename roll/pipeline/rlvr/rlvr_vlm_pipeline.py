@@ -24,7 +24,7 @@ from roll.datasets.collator import DataCollatorWithPaddingForMM
 from roll.datasets.dataset import get_dataset
 from roll.distributed.executor.cluster import Cluster
 from roll.distributed.scheduler.generate_scheduler import DynamicSamplingScheduler
-from roll.distributed.scheduler.protocol import DataProto
+from roll.distributed.scheduler.protocol import DataProto, materialize_rollout_transfer
 from roll.models.model_providers import default_processor_provider, get_extra_data_provider
 from roll.pipeline.base_pipeline import BasePipeline
 from roll.pipeline.rlvr.rlvr_config import RLVRConfig
@@ -504,7 +504,11 @@ class RLVRVLMPipeline(BasePipeline):
                             data=batch, global_step=global_step, batch_size=self.domain_batch_size[domain]
                         )
                     for domain, scheduler_ref in scheduler_refs.items():
-                        domain_batch: DataProto = ray.get(scheduler_ref, timeout=self.pipeline_config.rpc_timeout)
+                        domain_batch = materialize_rollout_transfer(
+                            handle=ray.get(scheduler_ref, timeout=self.pipeline_config.rpc_timeout),
+                            backend_name=self.pipeline_config.rollout_transfer_backend,
+                            protocol=self.pipeline_config.rollout_transfer_protocol,
+                        )
                         metrics_mgr.add_domain_metrics(
                             domain, reduce_metrics(domain_batch.meta_info.pop("metrics", {}))
                         )
@@ -543,7 +547,11 @@ class RLVRVLMPipeline(BasePipeline):
 
                     if self.pipeline_config.enable_old_logprobs_recompute:
                         old_log_probs_refs: List[ray.ObjectRef] = self.actor_train.compute_log_probs(batch, blocking=False)
-                        old_log_probs = DataProto.materialize_concat(data_refs=old_log_probs_refs)
+                        old_log_probs = DataProto.materialize_concat(
+                            data_refs=old_log_probs_refs,
+                            transfer_backend=self.pipeline_config.rollout_transfer_backend,
+                            transfer_protocol=self.pipeline_config.rollout_transfer_protocol,
+                        )
                         agg_entropy = agg_loss(
                             loss_mat=old_log_probs.batch["entropy"],
                             loss_mask=batch.batch["response_mask"][:, 1:],
@@ -558,7 +566,11 @@ class RLVRVLMPipeline(BasePipeline):
                         batch.batch["old_log_probs"] = torch.zeros_like(batch.batch["attention_mask"][:, 1:])
 
                     if self.pipeline_config.adv_estimator == "gae":
-                        values = DataProto.materialize_concat(data_refs=values_refs)
+                        values = DataProto.materialize_concat(
+                            data_refs=values_refs,
+                            transfer_backend=self.pipeline_config.rollout_transfer_backend,
+                            transfer_protocol=self.pipeline_config.rollout_transfer_protocol,
+                        )
                         batch = batch.union(values)
                         metrics_mgr.add_reduced_metrics(values.meta_info.pop("metrics", {}))
 
@@ -722,9 +734,13 @@ class RLVRVLMPipeline(BasePipeline):
             batch.meta_info.update(
                 {"global_step": self.global_step, "max_steps": self.pipeline_config.max_steps, "is_training": False}
             )
-            generate_output: DataProto = ray.get(
-                self.val_generate_scheduler.get_batch.remote(data=batch, global_step=global_step, batch_size=len(self.val_dataset)),
-                timeout=self.pipeline_config.rpc_timeout,
+            generate_output = materialize_rollout_transfer(
+                handle=ray.get(
+                    self.val_generate_scheduler.get_batch.remote(data=batch, global_step=global_step, batch_size=len(self.val_dataset)),
+                    timeout=self.pipeline_config.rpc_timeout,
+                ),
+                backend_name=self.pipeline_config.rollout_transfer_backend,
+                protocol=self.pipeline_config.rollout_transfer_protocol,
             )
             generate_output.meta_info.pop("is_offload_states", None)
             val_metrics_mgr.add_metric("time/step_generate", step_generate_timer.last)

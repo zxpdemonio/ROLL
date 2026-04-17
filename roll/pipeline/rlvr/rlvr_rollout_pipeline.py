@@ -12,7 +12,7 @@ from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from roll.datasets.collator import DataCollatorWithPaddingForPaddedKeys
 from roll.distributed.executor.cluster import Cluster
 from roll.distributed.scheduler.generate_scheduler import DynamicSamplingScheduler
-from roll.distributed.scheduler.protocol import DataProto
+from roll.distributed.scheduler.protocol import DataProto, materialize_rollout_transfer
 from roll.models.model_providers import default_tokenizer_provider
 from roll.pipeline.base_pipeline import BasePipeline
 from roll.pipeline.rlvr.rlvr_config import RLVRConfig
@@ -130,9 +130,13 @@ class RLVRRolloutPipeline(RLVRPipeline):
             self.actor_infer.load_states()
             for reward_cluster in self.rewards.values():
                 reward_cluster.load_states()
-            generate_output: DataProto = ray.get(
-                self.val_generate_scheduler.get_batch.remote(data=batch, global_step=global_step, batch_size=len(self.val_dataset)),
-                timeout=self.pipeline_config.rpc_timeout,
+            generate_output = materialize_rollout_transfer(
+                handle=ray.get(
+                    self.val_generate_scheduler.get_batch.remote(data=batch, global_step=global_step, batch_size=len(self.val_dataset)),
+                    timeout=self.pipeline_config.rpc_timeout,
+                ),
+                backend_name=self.pipeline_config.rollout_transfer_backend,
+                protocol=self.pipeline_config.rollout_transfer_protocol,
             )
             for reward_cluster in self.rewards.values():
                 reward_cluster.offload_states()

@@ -6,6 +6,7 @@ We can subclass Protocol to define more detailed batch info with specific keys
 
 import copy
 import os
+import pickle
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union, Set
@@ -27,6 +28,13 @@ POST_GENERATE_DROP_NON_TENSOR_KEYS: tuple[str, ...] = (
     "multi_modal_data",
     "mm_refs",
 )
+
+TRANSFER_MASK_DTYPES: dict[str, torch.dtype] = {
+    "attention_mask": torch.uint8,
+    "response_mask": torch.bool,
+    "prompt_mask": torch.bool,
+    "final_response_mask": torch.bool,
+}
 
 try:
     tensordict.set_lazy_legacy(False).set()
@@ -154,6 +162,139 @@ def custom_np_concatenate(val):
     concatenated_array = np.empty(len(concatenated_list), dtype=object)
     concatenated_array[:] = concatenated_list
     return concatenated_array
+
+
+def _append_buffer_chunk(chunks: list[bytes], payload: bytes) -> tuple[int, int]:
+    offset = sum(len(chunk) for chunk in chunks)
+    chunks.append(payload)
+    return offset, len(payload)
+
+
+def _encode_tensor_field(name: str, tensor: torch.Tensor, chunks: list[bytes]) -> dict[str, Any]:
+    tensor = tensor.detach().cpu().contiguous()
+    original_dtype = str(tensor.dtype).replace("torch.", "")
+    transfer_tensor = tensor.to(TRANSFER_MASK_DTYPES[name]) if name in TRANSFER_MASK_DTYPES else tensor
+    payload = transfer_tensor.numpy().tobytes(order="C")
+    offset, nbytes = _append_buffer_chunk(chunks, payload)
+    return {
+        "section": "batch",
+        "key": name,
+        "codec": "tensor",
+        "dtype": str(transfer_tensor.dtype).replace("torch.", ""),
+        "original_dtype": original_dtype,
+        "shape": list(transfer_tensor.shape),
+        "offset": offset,
+        "nbytes": nbytes,
+    }
+
+
+def _encode_string_array(values: np.ndarray, chunks: list[bytes]) -> dict[str, Any]:
+    encoded_items = [str(item).encode("utf-8") for item in values.tolist()]
+    offsets = np.zeros(len(encoded_items) + 1, dtype=np.int64)
+    total = 0
+    for idx, item in enumerate(encoded_items, start=1):
+        total += len(item)
+        offsets[idx] = total
+    payload = b"".join(encoded_items)
+    data_offset, data_nbytes = _append_buffer_chunk(chunks, payload)
+    offsets_offset, offsets_nbytes = _append_buffer_chunk(chunks, offsets.tobytes(order="C"))
+    return {
+        "codec": "string_array",
+        "dtype": "str",
+        "shape": [len(encoded_items)],
+        "offset": data_offset,
+        "nbytes": data_nbytes,
+        "offsets_offset": offsets_offset,
+        "offsets_nbytes": offsets_nbytes,
+    }
+
+
+def _encode_non_tensor_field(name: str, values: np.ndarray, chunks: list[bytes]) -> dict[str, Any]:
+    if values.dtype != object:
+        payload = np.ascontiguousarray(values).tobytes(order="C")
+        offset, nbytes = _append_buffer_chunk(chunks, payload)
+        return {
+            "section": "non_tensor_batch",
+            "key": name,
+            "codec": "ndarray",
+            "dtype": str(values.dtype),
+            "shape": list(values.shape),
+            "offset": offset,
+            "nbytes": nbytes,
+        }
+
+    value_list = values.tolist()
+    if all(isinstance(item, str) for item in value_list):
+        spec = _encode_string_array(values, chunks)
+        spec.update({"section": "non_tensor_batch", "key": name})
+        return spec
+
+    if all(isinstance(item, (bool, int, float, np.bool_, np.integer, np.floating)) for item in value_list):
+        numeric = np.asarray(value_list)
+        payload = np.ascontiguousarray(numeric).tobytes(order="C")
+        offset, nbytes = _append_buffer_chunk(chunks, payload)
+        return {
+            "section": "non_tensor_batch",
+            "key": name,
+            "codec": "numeric_scalar_array",
+            "dtype": str(numeric.dtype),
+            "shape": list(numeric.shape),
+            "offset": offset,
+            "nbytes": nbytes,
+        }
+
+    payload = pickle.dumps(value_list, protocol=5)
+    offset, nbytes = _append_buffer_chunk(chunks, payload)
+    return {
+        "section": "non_tensor_batch",
+        "key": name,
+        "codec": "pickle_object_array",
+        "dtype": "object",
+        "shape": list(values.shape),
+        "offset": offset,
+        "nbytes": nbytes,
+    }
+
+
+def _decode_tensor_field(buffer: memoryview, spec: dict[str, Any]) -> torch.Tensor:
+    np_dtype = np.dtype(spec["dtype"])
+    data = np.frombuffer(buffer[spec["offset"]:spec["offset"] + spec["nbytes"]], dtype=np_dtype).copy()
+    tensor = torch.from_numpy(data.reshape(spec["shape"]))
+    original_dtype = spec.get("original_dtype")
+    if original_dtype is not None and spec["dtype"] != original_dtype:
+        tensor = tensor.to(getattr(torch, original_dtype))
+    return tensor
+
+
+def _decode_non_tensor_field(buffer: memoryview, spec: dict[str, Any]) -> np.ndarray:
+    codec = spec["codec"]
+    if codec == "ndarray":
+        data = np.frombuffer(buffer[spec["offset"]:spec["offset"] + spec["nbytes"]], dtype=np.dtype(spec["dtype"])).copy()
+        values = data.reshape(spec["shape"]).tolist()
+        array = np.empty(np.prod(spec["shape"], dtype=int), dtype=object)
+        array[:] = values
+        return array.reshape(spec["shape"])
+    if codec == "numeric_scalar_array":
+        data = np.frombuffer(buffer[spec["offset"]:spec["offset"] + spec["nbytes"]], dtype=np.dtype(spec["dtype"])).copy()
+        values = data.reshape(spec["shape"]).tolist()
+        array = np.empty(np.prod(spec["shape"], dtype=int), dtype=object)
+        array[:] = values
+        return array.reshape(spec["shape"])
+    if codec == "string_array":
+        data = bytes(buffer[spec["offset"]:spec["offset"] + spec["nbytes"]])
+        offsets = np.frombuffer(
+            buffer[spec["offsets_offset"]:spec["offsets_offset"] + spec["offsets_nbytes"]], dtype=np.int64
+        ).copy()
+        values = [data[offsets[idx]:offsets[idx + 1]].decode("utf-8") for idx in range(len(offsets) - 1)]
+        array = np.empty(len(values), dtype=object)
+        array[:] = values
+        return array
+    if codec == "pickle_object_array":
+        values = pickle.loads(bytes(buffer[spec["offset"]:spec["offset"] + spec["nbytes"]]))
+        array = np.empty(len(values), dtype=object)
+        array[:] = values
+        return array.reshape(spec["shape"])
+    raise ValueError(f"Unsupported non-tensor codec: {codec}")
 
 
 @dataclass
@@ -415,6 +556,69 @@ class DataProto:
                 trimmed.non_tensor_batch.pop(key, None)
             return trimmed
         raise ValueError(f"Unsupported trim stage: {stage}")
+
+    def to_transfer_payload(self, stage: str, protocol: str = "v1") -> dict[str, Any]:
+        """Encode the DataProto into a backend-agnostic transfer payload."""
+        if protocol == "legacy":
+            return {
+                "protocol": "legacy",
+                "data": self.clone(),
+            }
+        if protocol != "v1":
+            raise ValueError(f"Unsupported transfer protocol: {protocol}")
+
+        trimmed = self.trim_for_stage(stage)
+        chunks: list[bytes] = []
+        buffer_specs: list[dict[str, Any]] = []
+
+        if trimmed.batch is not None:
+            for key in sorted(trimmed.batch.keys()):
+                buffer_specs.append(_encode_tensor_field(key, trimmed.batch[key], chunks))
+
+        for key in sorted(trimmed.non_tensor_batch.keys()):
+            buffer_specs.append(_encode_non_tensor_field(key, trimmed.non_tensor_batch[key], chunks))
+
+        meta_bytes = pickle.dumps(
+            {
+                "stage": stage,
+                "meta_info": trimmed.meta_info,
+                "batch_size": list(trimmed.batch.batch_size) if trimmed.batch is not None else None,
+            },
+            protocol=5,
+        )
+        bulk_buffer = b"".join(chunks)
+        return {
+            "protocol": "v1",
+            "meta_bytes": meta_bytes,
+            "bulk_buffer": bulk_buffer,
+            "buffer_specs": buffer_specs,
+        }
+
+    @classmethod
+    def from_transfer_payload(cls, payload: dict[str, Any]) -> "DataProto":
+        """Decode a backend-agnostic transfer payload into a DataProto."""
+        protocol = payload.get("protocol", "legacy")
+        if protocol == "legacy":
+            return payload["data"].clone()
+        if protocol != "v1":
+            raise ValueError(f"Unsupported transfer protocol: {protocol}")
+
+        metadata = pickle.loads(payload["meta_bytes"])
+        buffer = memoryview(payload["bulk_buffer"])
+
+        tensors: dict[str, torch.Tensor] = {}
+        non_tensors: dict[str, np.ndarray] = {}
+        for spec in payload["buffer_specs"]:
+            if spec["section"] == "batch":
+                tensors[spec["key"]] = _decode_tensor_field(buffer, spec)
+            elif spec["section"] == "non_tensor_batch":
+                non_tensors[spec["key"]] = _decode_non_tensor_field(buffer, spec)
+            else:
+                raise ValueError(f"Unsupported payload section: {spec['section']}")
+
+        batch_size = metadata.get("batch_size")
+        batch = TensorDict(source=tensors, batch_size=batch_size) if tensors else None
+        return cls(batch=batch, non_tensor_batch=non_tensors, meta_info=metadata["meta_info"])
 
     def select_idxs(self, idxs):
         """
@@ -838,6 +1042,8 @@ class DataProto:
             data_refs: Union[List[ray.ObjectRef], ray.ObjectRef, List["ObjectRefWrap"]],
             *,
             global_keys: Optional[Set[str]] = None,
+            transfer_backend: str = "legacy",
+            transfer_protocol: str = "legacy",
     ) -> "DataProto":
         """
         Fetch a collection of DataProto objects from Ray ObjectRef(s) and concatenate
@@ -866,15 +1072,114 @@ class DataProto:
 
         # Fetch objects from Ray
         if isinstance(data_refs[0], ObjectRefWrap):
-            data_refs: List[ObjectRefWrap]
+            data_refs = [ref for ref in data_refs if ref.collected]
+            if not data_refs:
+                raise ValueError("No collected rollout transfer refs to materialize")
             obj_refs = [ref.obj_ref for ref in data_refs]
             fetched = ray.get(obj_refs, timeout=timeout)
-            data = [fetched[i] for i, ref in enumerate(data_refs) if ref.collected]
+            data = [
+                materialize_rollout_transfer(
+                    handle=item,
+                    backend_name=transfer_backend,
+                    protocol=transfer_protocol,
+                )
+                for item in fetched
+            ]
         else:
-            data: List["DataProto"] = ray.get(data_refs, timeout=timeout)
+            fetched = ray.get(data_refs, timeout=timeout)
+            data = [
+                materialize_rollout_transfer(
+                    handle=item,
+                    backend_name=transfer_backend,
+                    protocol=transfer_protocol,
+                )
+                for item in fetched
+            ]
 
         # Concatenate and apply global aggregation rules
         return DataProto.concat(data, global_keys=global_keys)
+
+
+@dataclass
+class RolloutTransferHandle:
+    backend: str
+    protocol: str
+    stage: str
+    payload: Optional[dict[str, Any]] = None
+    obj_ref: Optional[ray.ObjectRef] = None
+
+
+class RolloutTransferBackend:
+    def __init__(self, protocol: str):
+        self.protocol = protocol
+
+    def put(self, data: DataProto, stage: str) -> RolloutTransferHandle:
+        raise NotImplementedError
+
+    def get(self, handle: RolloutTransferHandle) -> DataProto:
+        raise NotImplementedError
+
+    def cleanup(self, handle: RolloutTransferHandle) -> None:
+        return None
+
+
+class LegacyRolloutTransferBackend(RolloutTransferBackend):
+    def put(self, data: DataProto, stage: str) -> RolloutTransferHandle:
+        return RolloutTransferHandle(
+            backend="legacy",
+            protocol="legacy",
+            stage=stage,
+            payload=data.to_transfer_payload(stage=stage, protocol="legacy"),
+        )
+
+    def get(self, handle: RolloutTransferHandle) -> DataProto:
+        assert handle.payload is not None, "legacy transfer handle requires inline payload"
+        return DataProto.from_transfer_payload(handle.payload)
+
+
+class RayOptimizedRolloutTransferBackend(RolloutTransferBackend):
+    def __init__(self, protocol: str):
+        if protocol != "v1":
+            raise ValueError("ray_optimized transfer backend requires rollout_transfer_protocol='v1'")
+        super().__init__(protocol=protocol)
+
+    def put(self, data: DataProto, stage: str) -> RolloutTransferHandle:
+        payload = data.to_transfer_payload(stage=stage, protocol=self.protocol)
+        return RolloutTransferHandle(
+            backend="ray_optimized",
+            protocol=self.protocol,
+            stage=stage,
+            obj_ref=ray.put(payload),
+        )
+
+    def get(self, handle: RolloutTransferHandle) -> DataProto:
+        assert handle.obj_ref is not None, "ray_optimized transfer handle requires object ref"
+        payload = ray.get(handle.obj_ref)
+        return DataProto.from_transfer_payload(payload)
+
+
+def get_rollout_transfer_backend(backend_name: str, protocol: str) -> RolloutTransferBackend:
+    if backend_name == "legacy":
+        return LegacyRolloutTransferBackend(protocol="legacy")
+    if backend_name == "ray_optimized":
+        return RayOptimizedRolloutTransferBackend(protocol=protocol)
+    if backend_name == "mooncake":
+        raise NotImplementedError("mooncake rollout transfer backend is not implemented yet")
+    raise ValueError(f"Unsupported rollout transfer backend: {backend_name}")
+
+
+def uses_optimized_rollout_transfer(backend_name: str) -> bool:
+    return backend_name != "legacy"
+
+
+def materialize_rollout_transfer(handle: Union[DataProto, RolloutTransferHandle], backend_name: str, protocol: str) -> DataProto:
+    if isinstance(handle, DataProto):
+        return handle
+    backend = get_rollout_transfer_backend(backend_name=backend_name, protocol=protocol)
+    try:
+        return backend.get(handle)
+    finally:
+        backend.cleanup(handle)
 
 
 class ObjectRefWrap:

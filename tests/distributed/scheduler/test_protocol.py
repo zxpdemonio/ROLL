@@ -247,6 +247,66 @@ def test_trim_for_stage_rejects_unknown_stage() -> None:
         proto.trim_for_stage("unknown_stage")
 
 
+def test_transfer_payload_v1_round_trip_preserves_tensor_and_non_tensor_fields() -> None:
+    proto = DataProto.from_dict(
+        tensors={
+            "input_ids": torch.arange(12, dtype=torch.long).reshape(2, 6),
+            "attention_mask": torch.ones((2, 6), dtype=torch.long),
+            "response_mask": torch.tensor([[1, 0, 1], [0, 1, 1]], dtype=torch.long),
+        },
+        non_tensors={
+            "domain": ["math", "code"],
+            "score": [1.5, 2.5],
+            "payload": [{"step": 1}, {"step": 2}],
+        },
+        meta_info={"metrics": {"acc": [0.5, 0.75]}}
+    )
+
+    payload = proto.to_transfer_payload(stage="generate_request", protocol="v1")
+    restored = DataProto.from_transfer_payload(payload)
+
+    assert payload["protocol"] == "v1"
+    assert restored.meta_info == proto.meta_info
+    assert restored.batch.batch_size == proto.batch.batch_size
+    for key in proto.batch.keys():
+        assert torch.equal(restored.batch[key], proto.batch[key])
+    for key in proto.non_tensor_batch.keys():
+        np.testing.assert_array_equal(restored.non_tensor_batch[key], proto.non_tensor_batch[key])
+
+
+def test_transfer_payload_v1_applies_stage_trim() -> None:
+    proto = DataProto.from_dict(
+        tensors={"input_ids": torch.ones((1, 3), dtype=torch.long)},
+        non_tensors={
+            "multi_modal_data": [{"prompt_token_ids": [1, 2, 3], "multi_modal_data": {"image": ["blob"]}}],
+            "multi_modal_inputs": [{"image_grid_thw": torch.ones((1, 3), dtype=torch.long)}],
+        },
+    )
+
+    payload = proto.to_transfer_payload(stage="post_generate", protocol="v1")
+    restored = DataProto.from_transfer_payload(payload)
+
+    assert "multi_modal_data" not in restored.non_tensor_batch
+    assert "multi_modal_inputs" in restored.non_tensor_batch
+
+
+def test_transfer_payload_legacy_round_trip_returns_clone() -> None:
+    proto = DataProto.from_dict(
+        tensors={"input_ids": torch.arange(6, dtype=torch.long).reshape(2, 3)},
+        non_tensors={"domain": ["math", "code"]},
+        meta_info={"seed": 42},
+    )
+
+    payload = proto.to_transfer_payload(stage="generate_request", protocol="legacy")
+    restored = DataProto.from_transfer_payload(payload)
+
+    assert payload["protocol"] == "legacy"
+    assert restored is not proto
+    assert torch.equal(restored.batch["input_ids"], proto.batch["input_ids"])
+    np.testing.assert_array_equal(restored.non_tensor_batch["domain"], proto.non_tensor_batch["domain"])
+    assert restored.meta_info == proto.meta_info
+
+
 def test_clone_independence(create_data_proto):
     """Test that clone() returns an independent copy with the same content."""
     dp = create_data_proto

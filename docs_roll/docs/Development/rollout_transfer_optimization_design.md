@@ -244,10 +244,12 @@ Do not serialize the whole `TensorDict` as one opaque object. Instead:
 
 Add explicit transfer helpers to `DataProto`:
 
-- `to_transfer_payload(stage: str)`
+- `to_transfer_payload(stage: str, protocol: str = "v1")`
 - `from_transfer_payload(payload)`
 
 The optimized transfer path should use these methods, while the legacy path can continue to rely on current behavior.
+
+For the first implementation, `protocol="legacy"` returns a cloned `DataProto` wrapper payload for compatibility, while `protocol="v1"` emits the explicit backend-agnostic encoded payload.
 
 ### Transfer payload structure
 
@@ -267,10 +269,18 @@ Each tensor field in `batch` should be encoded individually as:
 
 - CPU contiguous buffer
 - dtype
+- original dtype when transfer-time compaction is applied
 - shape
 - offset and size into the bulk buffer
 
 This avoids whole-`TensorDict` `torch.save` costs and makes transport layout explicit.
+
+In the first implementation, transfer-time mask compaction is applied for common mask fields:
+
+- `attention_mask -> uint8`
+- `response_mask -> bool`
+- `prompt_mask -> bool`
+- `final_response_mask -> bool`
 
 ### Non-tensor encoding
 
@@ -279,6 +289,8 @@ Non-tensor fields should be encoded by category.
 #### Numeric arrays
 
 Encode as raw contiguous bytes with dtype and shape.
+
+For compatibility with `DataProto`'s current `non_tensor_batch` contract, decoded numeric arrays are materialized back into `dtype=object` arrays.
 
 #### String arrays
 
@@ -340,19 +352,27 @@ Keep current behavior for compatibility:
 
 Use the new transfer protocol but still store/fetch via Ray.
 
+Important boundary:
+
+- ROLL-owned encode/decode logic must stay in the transfer protocol layer
+- Ray should only be used as the transport/storage primitive for the already-encoded payload
+- do not move ROLL-specific payload logic into Ray serializer hooks or Ray-specific object semantics
+
 Flow:
 
 1. `DataProto -> TransferPayload`
 2. `TransferPayload -> ray.put(single object)`
 3. `ray.get(...) -> TransferPayload -> DataProto`
 
-This allows protocol gains to be measured independently of Mooncake.
+This allows protocol gains to be measured independently of Mooncake and keeps Ray from becoming the owner of rollout payload semantics.
 
 #### 3. `mooncake`
 
 Future backend.
 
 Use the same `TransferPayload` but store it as a single bulk value in Mooncake.
+
+`mooncake` and `ray_optimized` are competing backend implementations over the same transfer protocol, not a layered dependency where Mooncake sits underneath Ray.
 
 This aligns with the useful design direction from `THUDM/slime#1709`:
 
