@@ -370,7 +370,13 @@ This allows protocol gains to be measured independently of Mooncake and keeps Ra
 
 #### 3. `mooncake`
 
-Future backend.
+Implemented as a competing backend over the same `TransferPayload`.
+
+Current first-step behavior:
+
+- real Mooncake store transport is used when Mooncake runtime bootstrap succeeds
+- otherwise the backend falls back to a clearly labeled compatibility transport mode for functional validation
+- transfer metrics include `transfer/mooncake_transport_mode` so benchmark runs can distinguish true Mooncake store runs from fallback runs
 
 Use the same `TransferPayload` but store it as a single bulk value in Mooncake.
 

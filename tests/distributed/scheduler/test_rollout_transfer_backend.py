@@ -1,6 +1,9 @@
+import os
+
+import numpy as np
+import pytest
 import ray
 import torch
-import numpy as np
 
 from roll.distributed.scheduler.protocol import (
     DataProto,
@@ -88,3 +91,34 @@ def test_ray_optimized_rollout_transfer_backend_emits_metrics() -> None:
         assert metrics["transfer/bytes/total"] > 0
     finally:
         ray.shutdown()
+
+
+def test_mooncake_rollout_transfer_backend_round_trip_uses_fallback_when_runtime_unavailable() -> None:
+    os.environ.pop("ROLL_MOONCAKE_STRICT", None)
+    ray.init(local_mode=True, ignore_reinit_error=True)
+    try:
+        proto = DataProto.from_dict(
+            tensors={"input_ids": torch.arange(8, dtype=torch.long).reshape(2, 4)},
+            non_tensors={"domain": ["math", "code"], "score": [1.0, 2.0]},
+            meta_info={"metrics": {"acc": [0.5, 1.0]}, "rollout_transfer_metrics_enabled": True},
+        )
+
+        backend = get_rollout_transfer_backend("mooncake", "v1")
+        handle = backend.put(proto, stage="post_generate")
+        restored = backend.get(handle)
+
+        assert isinstance(handle, RolloutTransferHandle)
+        assert handle.backend == "mooncake"
+        assert handle.transport_info["mode"] in {"store", "ray_bytes_fallback"}
+        assert torch.equal(restored.batch["input_ids"], proto.batch["input_ids"])
+        np.testing.assert_array_equal(restored.non_tensor_batch["domain"], proto.non_tensor_batch["domain"])
+        np.testing.assert_array_equal(restored.non_tensor_batch["score"], proto.non_tensor_batch["score"])
+        assert restored.meta_info["metrics"]["transfer/backend"] == "mooncake"
+        assert restored.meta_info["metrics"]["transfer/mooncake_transport_mode"] in {"store", "ray_bytes_fallback"}
+    finally:
+        ray.shutdown()
+
+
+def test_mooncake_rollout_transfer_backend_requires_v1_protocol() -> None:
+    with pytest.raises(ValueError, match="mooncake transfer backend requires"):
+        get_rollout_transfer_backend("mooncake", "legacy")

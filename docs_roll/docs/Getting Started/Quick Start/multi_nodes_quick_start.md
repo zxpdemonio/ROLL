@@ -73,6 +73,76 @@ export GLOO_SOCKET_IFNAME=eth0
 ray start --address='ip of master node:port of master node' --num-gpus=2
 ```
 
+## Two-machine rollout transfer benchmark
+
+Use `examples/start_rollout_transfer_benchmark.py` with the example config
+`examples/qwen3-vl-4B-rlvr_megatron/rlvr_dual_node_transfer_benchmark.yaml` when you want a transfer-heavy run where
+`actor_infer` stays on machine 0 and `actor_train` plus `reference` stay on machine 1.
+
+### Master node (rank 0)
+```shell
+export MASTER_ADDR="ip of master node"
+export MASTER_PORT=6379
+export WORLD_SIZE=2
+export RANK=0
+export NCCL_SOCKET_IFNAME=eth0
+export GLOO_SOCKET_IFNAME=eth0
+
+# Mooncake benchmark defaults to RDMA for this script.
+# Override these only when your deployment needs different values.
+export MOONCAKE_DEVICE=mlx5_0
+# optional override if you do not use the default store port
+# export MOONCAKE_MASTER="${MASTER_ADDR}:50051"
+
+bash examples/qwen3-vl-4B-rlvr_megatron/run_rollout_transfer_dual_node_benchmark.sh \
+  rollout_transfer_backend=mooncake
+```
+
+### Worker node (rank 1)
+```shell
+export MASTER_ADDR="ip of master node"
+export MASTER_PORT=6379
+export WORLD_SIZE=2
+export RANK=1
+export NCCL_SOCKET_IFNAME=eth0
+export GLOO_SOCKET_IFNAME=eth0
+export MOONCAKE_DEVICE=mlx5_0
+
+bash examples/qwen3-vl-4B-rlvr_megatron/run_rollout_transfer_dual_node_benchmark.sh \
+  rollout_transfer_backend=mooncake
+```
+
+### Compare backends
+Use the same script and swap only the backend override:
+
+```shell
+bash examples/qwen3-vl-4B-rlvr_megatron/run_rollout_transfer_dual_node_benchmark.sh \
+  rollout_transfer_backend=legacy
+
+bash examples/qwen3-vl-4B-rlvr_megatron/run_rollout_transfer_dual_node_benchmark.sh \
+  rollout_transfer_backend=ray_optimized
+
+bash examples/qwen3-vl-4B-rlvr_megatron/run_rollout_transfer_dual_node_benchmark.sh \
+  rollout_transfer_backend=mooncake
+```
+
+### Metrics to check
+The benchmark enables rollout transfer metrics and profiling by default. Compare:
+
+- `transfer/backend`
+- `transfer/protocol`
+- `transfer/time/serialize`
+- `transfer/time/put`
+- `transfer/time/get`
+- `transfer/time/deserialize`
+- `transfer/bytes/total`
+- `transfer/profile/time_seconds/to_transfer_payload`
+- `transfer/profile/time_seconds/from_transfer_payload`
+- `transfer/mooncake_transport_mode`
+
+Only treat Mooncake-vs-Ray performance comparisons as valid when
+`transfer/mooncake_transport_mode=store`. If it reports `ray_bytes_fallback`, the run only proves functional compatibility.
+
 ## Reference: Multi-GPU V100 Memory Configuration Key Points
 ```yaml
 # Reduce the expected number of GPUs from 8 to the 2 V100s you actually have

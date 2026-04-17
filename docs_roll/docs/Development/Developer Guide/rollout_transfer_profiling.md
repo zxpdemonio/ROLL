@@ -47,6 +47,8 @@ It covers:
 1. protocol-layer v1 encode/decode metrics
 2. multimodal dedup vs inline payload duplication during request expansion
 3. optimized Ray backend round-trip profiling metrics
+4. Mooncake backend round-trip profiling metrics
+5. operator-facing dual-node benchmark flow via `examples/start_rollout_transfer_benchmark.py`
 
 ## Running
 
@@ -62,8 +64,20 @@ Run the core transfer regression suite with:
 pytest tests/distributed/scheduler/test_protocol.py tests/distributed/scheduler/test_rollout_transfer_backend.py -q
 ```
 
+Run the dual-node benchmark launcher with the provided example config:
+
+```bash
+python examples/start_rollout_transfer_benchmark.py \
+  --config_path examples/qwen3-vl-4B-rlvr_megatron \
+  --config_name rlvr_dual_node_transfer_benchmark
+```
+
+The shell wrapper at `examples/qwen3-vl-4B-rlvr_megatron/run_rollout_transfer_dual_node_benchmark.sh`
+adds the same defaults and makes Mooncake prefer RDMA by default for this benchmark path.
+
 ## Notes
 
 - Profiling is opt-in and should stay disabled in normal training runs.
 - RSS metrics are process-level snapshots, useful for regression tracking rather than exact allocator attribution.
-- `mooncake` remains a future competing backend over the same transfer payload format.
+- `mooncake` now uses the same transfer payload format as `ray_optimized`.
+- Use `transfer/mooncake_transport_mode` to distinguish real Mooncake store runs from `ray_bytes_fallback` compatibility runs.

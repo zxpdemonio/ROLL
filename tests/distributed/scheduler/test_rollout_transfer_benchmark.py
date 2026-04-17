@@ -124,3 +124,23 @@ def test_ray_backend_benchmark_reports_round_trip_profile_metrics() -> None:
         assert metrics["transfer/profile/peak_rss_gb/backend_get"] > 0
     finally:
         ray.shutdown()
+
+
+def test_mooncake_backend_benchmark_reports_round_trip_profile_metrics() -> None:
+    ray.init(local_mode=True, ignore_reinit_error=True)
+    try:
+        proto = _make_protocol_benchmark_proto(batch_size=16)
+        backend = get_rollout_transfer_backend("mooncake", "v1")
+        handle = backend.put(proto, stage="post_generate")
+        restored = materialize_rollout_transfer(handle, backend_name="mooncake", protocol="v1")
+
+        metrics = restored.meta_info["metrics"]
+        assert metrics["transfer/backend"] == "mooncake"
+        assert metrics["transfer/mooncake_transport_mode"] in {"store", "ray_bytes_fallback"}
+        assert metrics["transfer/time/serialize"] >= 0
+        assert metrics["transfer/time/put"] >= 0
+        assert metrics["transfer/time/get"] >= 0
+        assert metrics["transfer/time/deserialize"] >= 0
+        assert metrics["transfer/profile/temp_buffer_count/to_transfer_payload"] >= 1.0
+    finally:
+        ray.shutdown()

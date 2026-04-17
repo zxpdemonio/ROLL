@@ -252,11 +252,11 @@ class BaseConfig(ScheduleConfig):
     )
     rollout_transfer_backend: Literal["legacy", "ray_optimized", "mooncake"] = field(
         default="legacy",
-        metadata={"help": "Backend used for rollout transport."}
+        metadata={"help": "Backend used for rollout transport. mooncake requires rollout_transfer_protocol=v1."}
     )
     rollout_transfer_protocol: Literal["legacy", "v1"] = field(
         default="legacy",
-        metadata={"help": "Protocol used to encode rollout payloads for transport."}
+        metadata={"help": "Protocol used to encode rollout payloads for transport. mooncake and ray_optimized require v1."}
     )
     rollout_transfer_enable_string_codec: bool = field(
         default=False,

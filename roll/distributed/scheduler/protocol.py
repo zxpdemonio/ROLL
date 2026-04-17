@@ -8,6 +8,7 @@ import copy
 import os
 import pickle
 import time
+import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union, Set
@@ -47,6 +48,7 @@ TRANSFER_SEQUENCE_LENGTH_MAX_KEY = "transfer/sequence_length/max"
 TRANSFER_STAGE_KEY = "transfer/stage"
 TRANSFER_BACKEND_KEY = "transfer/backend"
 TRANSFER_PROTOCOL_KEY = "transfer/protocol"
+TRANSFER_MOONCAKE_TRANSPORT_MODE_KEY = "transfer/mooncake_transport_mode"
 TRANSFER_PROFILE_PREFIX = "transfer/profile"
 
 TRANSFER_MASK_DTYPES: dict[str, torch.dtype] = {
@@ -1350,6 +1352,8 @@ class RolloutTransferHandle:
     stage: str
     payload: Optional[dict[str, Any]] = None
     obj_ref: Optional[ray.ObjectRef] = None
+    key: Optional[str] = None
+    transport_info: Dict[str, Any] = field(default_factory=dict)
     stats: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -1372,6 +1376,154 @@ class RolloutTransferBackend:
 
     def cleanup(self, handle: RolloutTransferHandle) -> None:
         return None
+
+
+class _MooncakeTransportAdapter:
+    def mode(self) -> str:
+        raise NotImplementedError
+
+    def put_bytes(self, key: str, payload: bytes) -> RolloutTransferHandle:
+        raise NotImplementedError
+
+    def get_bytes(self, handle: RolloutTransferHandle) -> bytes:
+        raise NotImplementedError
+
+    def cleanup(self, handle: RolloutTransferHandle) -> None:
+        return None
+
+
+class _MooncakeFallbackTransportAdapter(_MooncakeTransportAdapter):
+    def mode(self) -> str:
+        return "ray_bytes_fallback"
+
+    def put_bytes(self, key: str, payload: bytes) -> RolloutTransferHandle:
+        return RolloutTransferHandle(
+            backend="mooncake",
+            protocol="v1",
+            stage="",
+            key=key,
+            obj_ref=ray.put(payload),
+            transport_info={"mode": self.mode()},
+        )
+
+    def get_bytes(self, handle: RolloutTransferHandle) -> bytes:
+        assert handle.obj_ref is not None, "fallback mooncake handle requires object ref"
+        return ray.get(handle.obj_ref)
+
+
+class _MooncakeStoreTransportAdapter(_MooncakeTransportAdapter):
+    def __init__(self):
+        from mooncake.mooncake_config import MooncakeConfig
+        from mooncake.store import MooncakeDistributedStore
+
+        config = MooncakeConfig.load_from_env()
+        store = MooncakeDistributedStore()
+        ret = store.setup(
+            {
+                "local_hostname": config.local_hostname,
+                "metadata_server": config.metadata_server,
+                "global_segment_size": config.global_segment_size,
+                "local_buffer_size": config.local_buffer_size,
+                "protocol": config.protocol,
+                "rdma_devices": config.device_name or "",
+                "master_server_addr": config.master_server_address,
+            }
+        )
+        if ret != 0:
+            raise RuntimeError(f"Mooncake store setup failed with code {ret}")
+        self.store = store
+
+    def mode(self) -> str:
+        return "store"
+
+    def put_bytes(self, key: str, payload: bytes) -> RolloutTransferHandle:
+        ret = self.store.upsert(key, payload)
+        if ret != 0:
+            raise RuntimeError(f"Mooncake store upsert failed for key={key} with code {ret}")
+        return RolloutTransferHandle(
+            backend="mooncake",
+            protocol="v1",
+            stage="",
+            key=key,
+            transport_info={"mode": self.mode()},
+        )
+
+    def get_bytes(self, handle: RolloutTransferHandle) -> bytes:
+        assert handle.key is not None, "Mooncake store handle requires key"
+        return self.store.get(handle.key)
+
+    def cleanup(self, handle: RolloutTransferHandle) -> None:
+        if handle.key is None:
+            return
+        self.store.remove(handle.key, True)
+
+
+class MooncakeRolloutTransferBackend(RolloutTransferBackend):
+    def __init__(self, protocol: str):
+        if protocol != "v1":
+            raise ValueError("mooncake transfer backend requires rollout_transfer_protocol='v1'")
+        super().__init__(protocol=protocol)
+        self._adapter: Optional[_MooncakeTransportAdapter] = None
+
+    def _get_adapter(self) -> _MooncakeTransportAdapter:
+        if self._adapter is not None:
+            return self._adapter
+        strict_mode = os.getenv("ROLL_MOONCAKE_STRICT", "0") == "1"
+        try:
+            self._adapter = _MooncakeStoreTransportAdapter()
+        except Exception:
+            if strict_mode:
+                raise
+            self._adapter = _MooncakeFallbackTransportAdapter()
+        return self._adapter
+
+    def put(self, data: DataProto, stage: str) -> RolloutTransferHandle:
+        adapter = self._get_adapter()
+        with Timer(logger=None) as serialize_timer:
+            payload = data.to_transfer_payload(stage=stage, protocol=self.protocol)
+            encoded_payload = pickle.dumps(payload, protocol=5)
+        with Timer(logger=None) as put_timer:
+            handle = adapter.put_bytes(
+                key=f"rollout/{stage}/{uuid.uuid4()}",
+                payload=encoded_payload,
+            )
+        stats = dict(payload.get("transfer_stats", {}))
+        if data.meta_info.get("rollout_transfer_metrics_enabled", False):
+            stats.update(
+                {
+                    TRANSFER_STAGE_KEY: stage,
+                    TRANSFER_BACKEND_KEY: "mooncake",
+                    TRANSFER_PROTOCOL_KEY: self.protocol,
+                    TRANSFER_MOONCAKE_TRANSPORT_MODE_KEY: adapter.mode(),
+                    TRANSFER_TIME_SERIALIZE_KEY: _safe_float(serialize_timer.last),
+                    TRANSFER_TIME_PUT_KEY: _safe_float(put_timer.last),
+                }
+            )
+        handle.stage = stage
+        handle.stats = stats
+        handle.transport_info = {"mode": adapter.mode()}
+        return handle
+
+    def get(self, handle: RolloutTransferHandle) -> DataProto:
+        adapter = self._get_adapter()
+        rss_before = _cpu_rss_gb()
+        with Timer(logger=None) as get_timer:
+            encoded_payload = adapter.get_bytes(handle)
+            payload = pickle.loads(encoded_payload)
+        with Timer(logger=None) as deserialize_timer:
+            data = DataProto.from_transfer_payload(payload)
+        if data.meta_info.get("rollout_transfer_metrics_enabled", False):
+            stats = dict(handle.stats)
+            stats[TRANSFER_TIME_GET_KEY] = _safe_float(get_timer.last)
+            stats[TRANSFER_TIME_DESERIALIZE_KEY] = _safe_float(deserialize_timer.last)
+            stats[TRANSFER_MOONCAKE_TRANSPORT_MODE_KEY] = adapter.mode()
+            _maybe_set_profiling_metric(stats, data, _profile_key("peak_rss_gb", "backend_get"), max(rss_before, _cpu_rss_gb()))
+            _maybe_set_profiling_metric(stats, data, _profile_key("time_seconds", "backend_get"), _safe_float(get_timer.last) + _safe_float(deserialize_timer.last))
+            self._maybe_record_transfer_metrics(data, stats)
+        return data
+
+    def cleanup(self, handle: RolloutTransferHandle) -> None:
+        self._get_adapter().cleanup(handle)
 
 
 class LegacyRolloutTransferBackend(RolloutTransferBackend):
@@ -1448,7 +1600,7 @@ def get_rollout_transfer_backend(backend_name: str, protocol: str) -> RolloutTra
     if backend_name == "ray_optimized":
         return RayOptimizedRolloutTransferBackend(protocol=protocol)
     if backend_name == "mooncake":
-        raise NotImplementedError("mooncake rollout transfer backend is not implemented yet")
+        return MooncakeRolloutTransferBackend(protocol=protocol)
     raise ValueError(f"Unsupported rollout transfer backend: {backend_name}")
 
 
