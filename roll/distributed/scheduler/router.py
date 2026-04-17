@@ -14,7 +14,7 @@ import ray
 
 from roll.distributed.executor.cluster import Cluster
 from roll.distributed.executor.worker import Worker
-from roll.distributed.scheduler.protocol import DataProto
+from roll.distributed.scheduler.protocol import DataProto, _profile_key, _record_profile_metrics
 from roll.configs.base_config import RouterArguments
 from roll.models.model_providers import default_tokenizer_provider
 from roll.utils.functionals import gather_unpadded_input_ids
@@ -584,6 +584,13 @@ class RouterClient:
                     "prompt_token_ids": mm_entry["prompt_token_ids"],
                     "multi_modal_data": mm_context[mm_ref_id],
                 }
+                _record_profile_metrics(
+                    req,
+                    {
+                        _profile_key("time_seconds", "mm_ref_resolve"): 0.0,
+                        _profile_key("resolved_ref_count", "mm_ref_resolve"): 1.0,
+                    },
+                )
             else:
                 payload["multi_modal_data"] = mm_entry
         else:

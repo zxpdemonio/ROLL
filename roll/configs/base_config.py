@@ -282,6 +282,10 @@ class BaseConfig(ScheduleConfig):
         default=False,
         metadata={"help": "Emit rollout transfer metrics for profiling and debugging."}
     )
+    rollout_transfer_profiling_enabled: bool = field(
+        default=False,
+        metadata={"help": "Emit fine-grained rollout transfer profiling metrics when enabled."}
+    )
 
 
     def to_dict(self):

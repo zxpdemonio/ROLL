@@ -3,6 +3,7 @@ import copy
 import itertools
 import math
 import random
+import time
 import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass, fields
@@ -20,6 +21,9 @@ from roll.distributed.executor.cluster import Cluster
 from roll.distributed.scheduler.router import RouterManager
 from roll.distributed.scheduler.protocol import (
     DataProto,
+    _collect_expansion_profile,
+    _profile_key,
+    _record_profile_metrics,
     get_rollout_transfer_backend,
     pad_dataproto_to_divisor,
     unpad_dataproto,
@@ -73,6 +77,7 @@ def expand_requests(data: DataProto, num_return_sequences, is_num_return_sequenc
         data (DataProto) [IN|OUT]: 'num_return_sequences' will be overwritten
     """
     assert "generation_config" in data.meta_info, f"data {data.meta_info} should have key 'generation_config'"
+    start_time = time.perf_counter()
     generation_config = data.meta_info["generation_config"]
     target_requests = []
     if is_num_return_sequences_expand:
@@ -90,6 +95,14 @@ def expand_requests(data: DataProto, num_return_sequences, is_num_return_sequenc
     else:
         generation_config["num_return_sequences"] = num_return_sequences
         target_requests.append(copy.deepcopy(data))
+    for req in target_requests:
+        _record_profile_metrics(
+            req,
+            {
+                **_collect_expansion_profile(data, target_requests, enable_mm_dedup),
+                _profile_key("time_seconds", "expand_requests"): time.perf_counter() - start_time,
+            },
+        )
     return target_requests
 
 def expand_responses(response: Optional[Union[DataProto, List[DataProto]]]) -> List[DataProto]:

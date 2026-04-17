@@ -7,6 +7,7 @@ We can subclass Protocol to define more detailed batch info with specific keys
 import copy
 import os
 import pickle
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union, Set
@@ -46,6 +47,7 @@ TRANSFER_SEQUENCE_LENGTH_MAX_KEY = "transfer/sequence_length/max"
 TRANSFER_STAGE_KEY = "transfer/stage"
 TRANSFER_BACKEND_KEY = "transfer/backend"
 TRANSFER_PROTOCOL_KEY = "transfer/protocol"
+TRANSFER_PROFILE_PREFIX = "transfer/profile"
 
 TRANSFER_MASK_DTYPES: dict[str, torch.dtype] = {
     "attention_mask": torch.uint8,
@@ -192,6 +194,21 @@ def _safe_float(value: Any) -> float:
     return float(value) if value is not None else 0.0
 
 
+def _profile_key(metric: str, stage: str) -> str:
+    return f"{TRANSFER_PROFILE_PREFIX}/{metric}/{stage}"
+
+
+def _cpu_rss_gb() -> float:
+    from roll.utils.context_managers import cpu_memory_info
+    return cpu_memory_info().rss / 1024**3
+
+
+def _maybe_set_profiling_metric(metrics: dict[str, Any], data: "DataProto", key: str, value: Any) -> None:
+    if not data.meta_info.get("rollout_transfer_profiling_enabled", False):
+        return
+    metrics[key] = value
+
+
 def _estimate_multimodal_bytes(values: np.ndarray) -> int:
     total = 0
     for item in values.tolist():
@@ -275,6 +292,37 @@ def _collect_transfer_stats(
         TRANSFER_SAMPLE_COUNT_KEY: sample_count,
         **sequence_metrics,
     }
+
+
+def _collect_expansion_profile(data: "DataProto", expanded: list["DataProto"], enable_mm_dedup: bool) -> dict[str, Any]:
+    metrics: dict[str, Any] = {}
+    _maybe_set_profiling_metric(metrics, data, _profile_key("request_count", "expand_requests"), float(len(expanded)))
+    if not data.meta_info.get("rollout_transfer_profiling_enabled", False):
+        return metrics
+    unique_mm_ref_ids = set()
+    duplicated_multimodal_payloads = 0
+    for req in expanded:
+        multi_modal_data = req.non_tensor_batch.get("multi_modal_data")
+        if multi_modal_data is None:
+            continue
+        for item in multi_modal_data.tolist():
+            if not isinstance(item, dict):
+                continue
+            if item.get("mm_ref_id") is not None:
+                unique_mm_ref_ids.add(item["mm_ref_id"])
+            if item.get("multi_modal_data") is not None:
+                duplicated_multimodal_payloads += 1
+    metrics[_profile_key("mm_ref_count", "expand_requests")] = float(len(unique_mm_ref_ids))
+    metrics[_profile_key("mm_dup_object_count", "expand_requests")] = float(duplicated_multimodal_payloads)
+    metrics[_profile_key("mm_dedup_enabled", "expand_requests")] = float(enable_mm_dedup)
+    return metrics
+
+
+def _record_profile_metrics(data: "DataProto", stats: dict[str, Any]) -> None:
+    if not stats or not data.meta_info.get("rollout_transfer_profiling_enabled", False):
+        return
+    metrics = data.meta_info.setdefault("metrics", {})
+    metrics.update(stats)
 
 
 def _encode_tensor_field(name: str, tensor: torch.Tensor, chunks: list[bytes]) -> dict[str, Any]:
@@ -651,16 +699,39 @@ class DataProto:
 
     def trim_for_stage(self, stage: str) -> "DataProto":
         """Return a stage-trimmed copy of the current DataProto."""
+        start_time = time.perf_counter()
+        before_keys = set(self.non_tensor_batch.keys())
         trimmed = self.clone()
         if stage == "generate_request":
+            _record_profile_metrics(
+                trimmed,
+                {
+                    _profile_key("time_seconds", "trim_for_stage"): time.perf_counter() - start_time,
+                    _profile_key("dropped_key_count", "trim_for_stage"): 0.0,
+                },
+            )
             return trimmed
         if stage == "post_generate":
             for key in POST_GENERATE_DROP_NON_TENSOR_KEYS:
                 trimmed.non_tensor_batch.pop(key, None)
+            _record_profile_metrics(
+                trimmed,
+                {
+                    _profile_key("time_seconds", "trim_for_stage"): time.perf_counter() - start_time,
+                    _profile_key("dropped_key_count", "trim_for_stage"): float(len(before_keys - set(trimmed.non_tensor_batch.keys()))),
+                },
+            )
             return trimmed
         if stage == "train_batch":
             for key in POST_GENERATE_DROP_NON_TENSOR_KEYS:
                 trimmed.non_tensor_batch.pop(key, None)
+            _record_profile_metrics(
+                trimmed,
+                {
+                    _profile_key("time_seconds", "trim_for_stage"): time.perf_counter() - start_time,
+                    _profile_key("dropped_key_count", "trim_for_stage"): float(len(before_keys - set(trimmed.non_tensor_batch.keys()))),
+                },
+            )
             return trimmed
         raise ValueError(f"Unsupported trim stage: {stage}")
 
@@ -674,6 +745,8 @@ class DataProto:
         if protocol != "v1":
             raise ValueError(f"Unsupported transfer protocol: {protocol}")
 
+        rss_before = _cpu_rss_gb()
+        start_time = time.perf_counter()
         multimodal_before = _estimate_multimodal_bytes(self.non_tensor_batch["multi_modal_data"]) if "multi_modal_data" in self.non_tensor_batch else 0
         trimmed = self.trim_for_stage(stage)
         if self.meta_info.get("rollout_transfer_debug_validate", False):
@@ -703,8 +776,9 @@ class DataProto:
             "bulk_buffer": bulk_buffer,
             "buffer_specs": buffer_specs,
         }
+        transfer_stats: dict[str, Any] = {}
         if trimmed.meta_info.get("rollout_transfer_metrics_enabled", False):
-            payload["transfer_stats"] = {
+            transfer_stats = {
                 **_collect_transfer_stats(
                     stage=stage,
                     protocol=protocol,
@@ -716,6 +790,26 @@ class DataProto:
                 ),
                 TRANSFER_BYTES_MULTIMODAL_BEFORE_KEY: multimodal_before,
             }
+        _maybe_set_profiling_metric(
+            transfer_stats,
+            trimmed,
+            _profile_key("temp_buffer_count", "to_transfer_payload"),
+            float(len(chunks) + len(buffer_specs) + 1),
+        )
+        _maybe_set_profiling_metric(
+            transfer_stats,
+            trimmed,
+            _profile_key("peak_rss_gb", "to_transfer_payload"),
+            max(rss_before, _cpu_rss_gb()),
+        )
+        _maybe_set_profiling_metric(
+            transfer_stats,
+            trimmed,
+            _profile_key("time_seconds", "to_transfer_payload"),
+            time.perf_counter() - start_time,
+        )
+        if transfer_stats:
+            payload["transfer_stats"] = transfer_stats
         if trimmed.meta_info.get("rollout_transfer_debug_validate", False):
             _validate_transfer_payload(payload)
         return payload
@@ -729,8 +823,8 @@ class DataProto:
         if protocol != "v1":
             raise ValueError(f"Unsupported transfer protocol: {protocol}")
 
-        if payload.get("transfer_stats") is not None and payload.get("meta_bytes") is not None:
-            pass
+        rss_before = _cpu_rss_gb()
+        start_time = time.perf_counter()
         metadata = pickle.loads(payload["meta_bytes"])
         if metadata["meta_info"].get("rollout_transfer_debug_validate", False):
             _validate_transfer_payload(payload)
@@ -748,7 +842,16 @@ class DataProto:
 
         batch_size = metadata.get("batch_size")
         batch = TensorDict(source=tensors, batch_size=batch_size) if tensors else None
-        return cls(batch=batch, non_tensor_batch=non_tensors, meta_info=metadata["meta_info"])
+        data = cls(batch=batch, non_tensor_batch=non_tensors, meta_info=metadata["meta_info"])
+        _record_profile_metrics(
+            data,
+            {
+                _profile_key("peak_rss_gb", "from_transfer_payload"): max(rss_before, _cpu_rss_gb()),
+                _profile_key("temp_buffer_count", "from_transfer_payload"): float(len(payload["buffer_specs"]) + 2),
+                _profile_key("time_seconds", "from_transfer_payload"): time.perf_counter() - start_time,
+            },
+        )
+        return data
 
     def select_idxs(self, idxs):
         """
@@ -1227,7 +1330,17 @@ class DataProto:
             ]
 
         # Concatenate and apply global aggregation rules
-        return DataProto.concat(data, global_keys=global_keys)
+        start_time = time.perf_counter()
+        result = DataProto.concat(data, global_keys=global_keys)
+        _record_profile_metrics(
+            result,
+            {
+                _profile_key("input_count", "materialize_concat"): float(len(data)),
+                _profile_key("time_seconds", "materialize_concat"): time.perf_counter() - start_time,
+                _profile_key("peak_rss_gb", "materialize_concat"): _cpu_rss_gb(),
+            },
+        )
+        return result
 
 
 @dataclass
@@ -1314,6 +1427,7 @@ class RayOptimizedRolloutTransferBackend(RolloutTransferBackend):
 
     def get(self, handle: RolloutTransferHandle) -> DataProto:
         assert handle.obj_ref is not None, "ray_optimized transfer handle requires object ref"
+        rss_before = _cpu_rss_gb()
         with Timer(logger=None) as get_timer:
             payload = ray.get(handle.obj_ref)
         with Timer(logger=None) as deserialize_timer:
@@ -1322,6 +1436,8 @@ class RayOptimizedRolloutTransferBackend(RolloutTransferBackend):
             stats = dict(handle.stats)
             stats[TRANSFER_TIME_GET_KEY] = _safe_float(get_timer.last)
             stats[TRANSFER_TIME_DESERIALIZE_KEY] = _safe_float(deserialize_timer.last)
+            _maybe_set_profiling_metric(stats, data, _profile_key("peak_rss_gb", "backend_get"), max(rss_before, _cpu_rss_gb()))
+            _maybe_set_profiling_metric(stats, data, _profile_key("time_seconds", "backend_get"), _safe_float(get_timer.last) + _safe_float(deserialize_timer.last))
             self._maybe_record_transfer_metrics(data, stats)
         return data
 
@@ -1343,9 +1459,18 @@ def uses_optimized_rollout_transfer(backend_name: str) -> bool:
 def materialize_rollout_transfer(handle: Union[DataProto, RolloutTransferHandle], backend_name: str, protocol: str) -> DataProto:
     if isinstance(handle, DataProto):
         return handle
+    start_time = time.perf_counter()
     backend = get_rollout_transfer_backend(backend_name=backend_name, protocol=protocol)
     try:
-        return backend.get(handle)
+        data = backend.get(handle)
+        _record_profile_metrics(
+            data,
+            {
+                _profile_key("time_seconds", "materialize_rollout_transfer"): time.perf_counter() - start_time,
+                _profile_key("peak_rss_gb", "materialize_rollout_transfer"): _cpu_rss_gb(),
+            },
+        )
+        return data
     finally:
         backend.cleanup(handle)
 

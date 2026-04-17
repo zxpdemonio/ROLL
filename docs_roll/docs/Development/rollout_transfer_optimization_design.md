@@ -748,6 +748,13 @@ When `rollout_transfer_debug_validate=true`, validation should fail explicitly o
 
 A dedicated profiling mode or benchmark script that can be run after development and used later for iterative tuning.
 
+Implemented first-step deliverables:
+
+- opt-in `rollout_transfer_profiling_enabled` config switch
+- fine-grained `transfer/profile/*` metrics emitted from request expansion, multimodal reference resolution, stage trim, protocol encode/decode, backend get, and materialization paths
+- benchmark-style coverage in `tests/distributed/scheduler/test_rollout_transfer_benchmark.py`
+- operator guide in `docs_roll/docs/Development/Developer Guide/rollout_transfer_profiling.md`
+
 This profiling task is part of the implementation plan and should be treated as a required follow-up task, not optional cleanup.
 
 ---
