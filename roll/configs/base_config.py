@@ -13,6 +13,13 @@ from roll.utils.logging import get_logger
 
 logger = get_logger()
 
+ROLLOUT_TRANSFER_STAGES: tuple[str, ...] = (
+    "generate_request",
+    "post_generate",
+    "train_batch",
+)
+
+
 @dataclass
 class RolloutMockConfig:
     """Configuration for rollout dump/mock mechanism for precision alignment testing."""
@@ -242,6 +249,38 @@ class BaseConfig(ScheduleConfig):
     rollout_mock: Optional[RolloutMockConfig] = field(
         default=None,
         metadata={"help": "Rollout mock configuration for precision alignment testing."}
+    )
+    rollout_transfer_backend: Literal["legacy", "ray_optimized", "mooncake"] = field(
+        default="legacy",
+        metadata={"help": "Backend used for rollout transport."}
+    )
+    rollout_transfer_protocol: Literal["legacy", "v1"] = field(
+        default="legacy",
+        metadata={"help": "Protocol used to encode rollout payloads for transport."}
+    )
+    rollout_transfer_enable_string_codec: bool = field(
+        default=False,
+        metadata={"help": "Enable string codec in optimized rollout transfer protocol."}
+    )
+    rollout_transfer_trim_stage: Literal["producer", "consumer"] = field(
+        default="producer",
+        metadata={"help": "Where to apply stage-aware rollout payload trimming."}
+    )
+    rollout_transfer_debug_validate: bool = field(
+        default=False,
+        metadata={"help": "Enable rollout transfer validation checks in debug mode."}
+    )
+    rollout_transfer_enable_mm_dedup: bool = field(
+        default=False,
+        metadata={"help": "Enable multimodal payload deduplication during rollout request expansion."}
+    )
+    rollout_transfer_enable_mm_strip: bool = field(
+        default=False,
+        metadata={"help": "Enable stripping generation-only multimodal payload after rollout generation."}
+    )
+    rollout_transfer_metrics_enabled: bool = field(
+        default=False,
+        metadata={"help": "Emit rollout transfer metrics for profiling and debugging."}
     )
 
 
