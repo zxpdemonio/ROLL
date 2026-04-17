@@ -616,6 +616,8 @@ class DynamicSamplingScheduler(RolloutMockMixin):
             batch: DataProto = self.actor_cluster.generate(gen_batch_padded)
             batch = unpad_dataproto(batch, pad_size * num_return_sequences)
 
+            if self.pipeline_config.rollout_transfer_enable_mm_strip:
+                request_data = request_data.trim_for_stage("post_generate")
             batch.union(other=request_data)
             batch.rename(old_keys="prompt_id", new_keys="origin_prompt_id")
             batch_rewards = await self.reward_scheduler.compute_rewards(data=batch, reward_clusters=self.reward_clusters, pipeline_config=self.pipeline_config)

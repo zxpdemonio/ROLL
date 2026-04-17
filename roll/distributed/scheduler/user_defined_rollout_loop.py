@@ -246,6 +246,8 @@ class UserDefinedRolloutLoop:
                     return
                 elif is_report_data_finished(data):
                     req = postprocess_output_data(req, data, context.sequence_length)
+                    if context.pipeline_config.rollout_transfer_enable_mm_strip:
+                        req = req.trim_for_stage("post_generate")
                     break
                 else:
                     if not collect_unfinished:

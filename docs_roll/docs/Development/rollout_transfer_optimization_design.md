@@ -396,6 +396,8 @@ This keeps multimodal payload prompt-scoped.
 
 After generation and response postprocessing, remove multimodal generation-only payload before the rollout batch enters reward, concat, and training.
 
+In the first implementation, `post_generate` trimming should drop raw infer-engine `multi_modal_data` while preserving reward-required `multi_modal_inputs`.
+
 ### Integration item 4: use optimized transfer protocol for post-generate batches
 
 Once the rollout batch is text-dominant and multimodal fields have been stripped, use the optimized `DataProto` transfer protocol for transport-heavy boundaries.

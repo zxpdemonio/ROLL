@@ -224,6 +224,29 @@ def test_concat_global_keys_dict_missing_subkeys():
     assert np.isclose(reduced["acc"], expected_acc.mean())
     assert np.isclose(reduced["precision"], expected_precision.mean())
 
+def test_trim_for_stage_post_generate_drops_generation_only_multimodal_payload() -> None:
+    proto = DataProto.from_dict(
+        tensors={"input_ids": torch.ones((1, 3), dtype=torch.long)},
+        non_tensors={
+            "multi_modal_data": [{"prompt_token_ids": [1, 2, 3], "multi_modal_data": {"image": ["blob"]}}],
+            "multi_modal_inputs": [{"image_grid_thw": torch.ones((1, 3), dtype=torch.long)}],
+        },
+    )
+
+    trimmed = proto.trim_for_stage("post_generate")
+
+    assert "multi_modal_data" not in trimmed.non_tensor_batch
+    assert "multi_modal_inputs" in trimmed.non_tensor_batch
+    assert "multi_modal_data" in proto.non_tensor_batch
+
+
+def test_trim_for_stage_rejects_unknown_stage() -> None:
+    proto = DataProto.from_dict(tensors={"input_ids": torch.ones((1, 2), dtype=torch.long)})
+
+    with pytest.raises(ValueError, match="Unsupported trim stage"):
+        proto.trim_for_stage("unknown_stage")
+
+
 def test_clone_independence(create_data_proto):
     """Test that clone() returns an independent copy with the same content."""
     dp = create_data_proto

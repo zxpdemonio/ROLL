@@ -23,6 +23,11 @@ from roll.utils.logging import get_logger
 
 logger = get_logger()
 
+POST_GENERATE_DROP_NON_TENSOR_KEYS: tuple[str, ...] = (
+    "multi_modal_data",
+    "mm_refs",
+)
+
 try:
     tensordict.set_lazy_legacy(False).set()
 except:
@@ -395,6 +400,21 @@ class DataProto:
             sub_meta_info = copy.deepcopy(sub_meta_info)
 
         return DataProto(batch=sub_batch, non_tensor_batch=non_tensor_batch, meta_info=sub_meta_info)
+
+    def trim_for_stage(self, stage: str) -> "DataProto":
+        """Return a stage-trimmed copy of the current DataProto."""
+        trimmed = self.clone()
+        if stage == "generate_request":
+            return trimmed
+        if stage == "post_generate":
+            for key in POST_GENERATE_DROP_NON_TENSOR_KEYS:
+                trimmed.non_tensor_batch.pop(key, None)
+            return trimmed
+        if stage == "train_batch":
+            for key in POST_GENERATE_DROP_NON_TENSOR_KEYS:
+                trimmed.non_tensor_batch.pop(key, None)
+            return trimmed
+        raise ValueError(f"Unsupported trim stage: {stage}")
 
     def select_idxs(self, idxs):
         """
