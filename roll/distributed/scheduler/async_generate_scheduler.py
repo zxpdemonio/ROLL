@@ -19,7 +19,7 @@ from tqdm import tqdm
 from transformers import set_seed
 
 from roll.distributed.executor.cluster import Cluster
-from roll.distributed.scheduler.generate_scheduler import GlobalCounter
+from roll.distributed.scheduler.generate_scheduler import GlobalCounter, expand_requests
 from roll.distributed.scheduler.protocol import DataProto
 from roll.models.model_providers import default_tokenizer_provider
 from roll.utils.constants import RAY_NAMESPACE
@@ -812,16 +812,12 @@ class AsyncDynamicSamplingScheduler:
         assert "generation_config" in data.meta_info, f"data {data.meta_info} should have key 'generation_config'"
         generation_config = data.meta_info["generation_config"]
 
-        target_requests = []
-        if is_num_return_sequences_expand:
-            generation_config["num_return_sequences"] = 1
-            for _ in range(num_return_sequences):
-                target_requests.append(copy.deepcopy(data))
-        else:
-            generation_config["num_return_sequences"] = num_return_sequences
-            target_requests.append(copy.deepcopy(data))
-
-        return target_requests
+        return expand_requests(
+            data=data,
+            num_return_sequences=num_return_sequences,
+            is_num_return_sequences_expand=is_num_return_sequences_expand,
+            enable_mm_dedup=self.pipeline_config.rollout_transfer_enable_mm_dedup,
+        )
 
     def check_worker_alive(self, cluster):
         current_time = time.time()

@@ -185,8 +185,12 @@ class UserDefinedRolloutLoop:
         ################# STEP 1: get and filter dataset
         # TODO shigao dataset这一层应该暴露哪些部分(是collect前还是后面的数据呢)，需要用户自定义collect_fn吗
         request_data, domain = context.get_request_data(meta_info=context.meta_info)
-        request_data_list = expand_requests(data=request_data, num_return_sequences=num_return_sequences,
-                            is_num_return_sequences_expand=is_num_return_sequences_expand)
+        request_data_list = expand_requests(
+            data=request_data,
+            num_return_sequences=num_return_sequences,
+            is_num_return_sequences_expand=is_num_return_sequences_expand,
+            enable_mm_dedup=context.pipeline_config.rollout_transfer_enable_mm_dedup,
+        )
         # TODO data filter
 
         ################# STEP 2: spawn tasks to process requests, including generate, reward, and filter at response level

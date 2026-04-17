@@ -571,7 +571,21 @@ class RouterClient:
         if "multi_modal_data" in req.non_tensor_batch:
             multi_modal_data = req.non_tensor_batch["multi_modal_data"]
             assert len(multi_modal_data) == 1
-            payload["multi_modal_data"] = multi_modal_data[0]
+            mm_entry = multi_modal_data[0]
+            mm_ref_id = mm_entry.get("mm_ref_id")
+            has_inline_mm = "multi_modal_data" in mm_entry
+            if mm_ref_id is not None:
+                mm_context = req.meta_info.get("mm_context", {})
+                if mm_ref_id not in mm_context:
+                    raise ValueError(f"missing multimodal context for mm_ref_id={mm_ref_id}")
+                if has_inline_mm:
+                    raise ValueError("multimodal request cannot include both mm_ref_id and inline multi_modal_data")
+                payload["multi_modal_data"] = {
+                    "prompt_token_ids": mm_entry["prompt_token_ids"],
+                    "multi_modal_data": mm_context[mm_ref_id],
+                }
+            else:
+                payload["multi_modal_data"] = mm_entry
         else:
             input_ids = req.batch["input_ids"]
             assert not collect_unfinished or input_ids.size(0) == 1

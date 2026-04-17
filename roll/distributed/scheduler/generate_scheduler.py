@@ -1,8 +1,8 @@
 import asyncio
 import copy
 import itertools
-import random
 import math
+import random
 import uuid
 from collections import defaultdict, deque
 from dataclasses import dataclass, fields
@@ -31,7 +31,38 @@ from roll.utils.logging import get_logger
 logger = get_logger()
 
 
-def expand_requests(data: DataProto, num_return_sequences, is_num_return_sequences_expand):
+def _copy_non_tensor_batch(non_tensor_batch: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    return {key: np.copy(value) for key, value in non_tensor_batch.items()}
+
+
+def _build_mm_expanded_request(data: DataProto, mm_ref_id: str | None = None) -> DataProto:
+    non_tensor_batch = _copy_non_tensor_batch(data.non_tensor_batch)
+    multi_modal_data = non_tensor_batch.get("multi_modal_data")
+    if multi_modal_data is None or len(multi_modal_data) == 0:
+        return DataProto(batch=data.batch.clone(), non_tensor_batch=non_tensor_batch, meta_info=copy.deepcopy(data.meta_info))
+
+    assert len(multi_modal_data) == 1, "multimodal request expansion expects a single prompt per request"
+    mm_entry = multi_modal_data[0]
+    mm_payload = mm_entry.get("multi_modal_data")
+    if mm_payload is None:
+        return DataProto(batch=data.batch.clone(), non_tensor_batch=non_tensor_batch, meta_info=copy.deepcopy(data.meta_info))
+
+    mm_ref_id = mm_ref_id or mm_entry.get("mm_ref_id") or str(uuid.uuid4())
+    prompt_token_ids = list(mm_entry["prompt_token_ids"])
+    mm_refs = np.empty(1, dtype=object)
+    mm_refs[0] = {
+        "mm_ref_id": mm_ref_id,
+        "prompt_token_ids": prompt_token_ids,
+    }
+    non_tensor_batch["multi_modal_data"] = mm_refs
+
+    meta_info = copy.deepcopy(data.meta_info)
+    mm_context = meta_info.setdefault("mm_context", {})
+    mm_context[mm_ref_id] = mm_payload
+    return DataProto(batch=data.batch.clone(), non_tensor_batch=non_tensor_batch, meta_info=meta_info)
+
+
+def expand_requests(data: DataProto, num_return_sequences, is_num_return_sequences_expand, enable_mm_dedup: bool = False):
     """
     Args:
         data (DataProto) [IN|OUT]: 'num_return_sequences' will be overwritten
@@ -41,8 +72,16 @@ def expand_requests(data: DataProto, num_return_sequences, is_num_return_sequenc
     target_requests = []
     if is_num_return_sequences_expand:
         generation_config["num_return_sequences"] = 1
+        shared_mm_ref_id = None
+        if enable_mm_dedup and "multi_modal_data" in data.non_tensor_batch and len(data.non_tensor_batch["multi_modal_data"]) == 1:
+            mm_entry = data.non_tensor_batch["multi_modal_data"][0]
+            if mm_entry.get("multi_modal_data") is not None:
+                shared_mm_ref_id = mm_entry.get("mm_ref_id") or str(uuid.uuid4())
         for _ in range(num_return_sequences):
-            target_requests.append(copy.deepcopy(data))
+            if enable_mm_dedup:
+                target_requests.append(_build_mm_expanded_request(data=data, mm_ref_id=shared_mm_ref_id))
+            else:
+                target_requests.append(copy.deepcopy(data))
     else:
         generation_config["num_return_sequences"] = num_return_sequences
         target_requests.append(copy.deepcopy(data))

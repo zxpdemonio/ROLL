@@ -381,6 +381,8 @@ Replace full-object request duplication with prompt-aware lightweight expansion.
 
 Expanded requests should share multimodal references rather than duplicate multimodal payload.
 
+In the first implementation, each expanded request should keep only request-local mutable prompt progression state such as `prompt_token_ids`, while the heavy immutable multimodal payload is moved behind a shared `mm_ref_id` stored in prompt-level context.
+
 ### Integration item 2: router preprocessing should support multimodal references
 
 `RouterClient._preprocess_generate()` should support:
