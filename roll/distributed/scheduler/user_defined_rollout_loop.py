@@ -103,7 +103,7 @@ def postprocess_paused_data(pre_data, data: DataProto, sequence_length, prompt_l
             # use new dict to replace repeated reference
             mm_data = new_non_tensor_batch["multi_modal_data"][i] = dict(mm_data)
             # VLM uses prompt_ids (without replaced image tokens) in multi_modal_data
-            prompt_token_ids = mm_data["prompt_token_ids"] + prompt_token_ids
+            prompt_token_ids = list(mm_data["prompt_token_ids"]) + list(prompt_token_ids)
             mm_data.update({"prompt_token_ids": prompt_token_ids})
     data = DataProto.from_dict(
         new_batch, non_tensors=new_non_tensor_batch, meta_info={**pre_data.meta_info, **data.meta_info}
@@ -121,7 +121,7 @@ def postprocess_output_data(request, data: DataProto, sequence_length) -> DataPr
     request.batch["attention_mask"] = request.batch.pop("init_attention_mask", request.batch["attention_mask"])
     output_token_ids = data.meta_info["output_token_ids"]
     pre_output_token_ids = request.meta_info.pop("pre_output_token_ids", [[]] * len(output_token_ids))
-    output_token_ids = [pre_output_token_ids[i] + output_token_ids[i] for i in range(len(pre_output_token_ids))]
+    output_token_ids = [list(pre_output_token_ids[i]) + list(output_token_ids[i]) for i in range(len(pre_output_token_ids))]
 
     output_logprobs = data.meta_info.get("output_logprobs", None)
     if output_logprobs is not None:

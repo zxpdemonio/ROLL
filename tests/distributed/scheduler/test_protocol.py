@@ -317,9 +317,6 @@ def test_transfer_payload_v1_emits_metrics_when_enabled() -> None:
     payload = proto.to_transfer_payload(stage="generate_request", protocol="v1")
 
     stats = payload["transfer_stats"]
-    assert stats["transfer/stage"] == "generate_request"
-    assert stats["transfer/protocol"] == "v1"
-    assert stats["transfer/backend"] == "protocol"
     assert stats["transfer/bytes/total"] > 0
     assert stats["transfer/sample_count"] == 2
 

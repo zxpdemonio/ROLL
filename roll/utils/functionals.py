@@ -211,10 +211,11 @@ def compute_approx_kl(
 
 
 def log_probs_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-    logits = logits.float()
-    log_probs = F.log_softmax(logits, dim=-1)
-    log_probs_labels = log_probs.gather(dim=-1, index=labels.unsqueeze(-1))
-    return log_probs_labels.squeeze(-1)
+    """Compute per-token log probabilities without materializing full log-softmax tensors."""
+    flat_logits = logits.reshape(-1, logits.size(-1))
+    flat_labels = labels.reshape(-1).long()
+    flat_log_probs = -F.cross_entropy(flat_logits, flat_labels, reduction="none")
+    return flat_log_probs.view_as(labels)
 
 
 def entropy_from_logits(logits: torch.Tensor):

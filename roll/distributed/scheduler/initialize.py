@@ -32,6 +32,10 @@ def start_ray_cluster():
     node_name = get_driver_node_name()
     dashboard_port = get_driver_dashboard_port()
 
+    if os.getenv("RAY_ADDRESS"):
+        logger.info("RAY_ADDRESS is set, skip starting a local Ray cluster")
+        return False
+
     if is_ray_cluster_running():
         logger.info("Ray cluster already initialized")
         return False
@@ -61,8 +65,31 @@ def init():
 
     manual_start = start_ray_cluster()
 
+    runtime_env_env_vars = current_platform.get_custom_env_vars()
+    for env_var in [
+        "NVTE_CUDA_INCLUDE_DIR",
+        "PYTHONPATH",
+        "MOONCAKE_PROTOCOL",
+        "MOONCAKE_MASTER",
+        "MOONCAKE_TE_META_DATA_SERVER",
+        "MOONCAKE_LOCAL_HOSTNAME",
+        "MOONCAKE_DEVICE",
+        "MOONCAKE_GLOBAL_SEGMENT_SIZE",
+        "MOONCAKE_LOCAL_BUFFER_SIZE",
+        "ROLL_MOONCAKE_STRICT",
+        "ROLL_MOONCAKE_ZEROCOPY_BUFFER_SIZE",
+        "ROLL_MOONCAKE_SCATTER_MAX_BYTES",
+        "ROLL_MOONCAKE_DISABLE_FAST_PATH",
+        "ROLL_MOONCAKE_PROFILE_RANGES",
+        "VLLM_USE_V1",
+        "CUDA_VISIBLE_DEVICES",
+    ]:
+        env_value = os.getenv(env_var)
+        if env_value:
+            runtime_env_env_vars[env_var] = env_value
+
     runtime_env = {
-        "env_vars": current_platform.get_custom_env_vars(),
+        "env_vars": runtime_env_env_vars,
     }
 
     if not ray.is_initialized():

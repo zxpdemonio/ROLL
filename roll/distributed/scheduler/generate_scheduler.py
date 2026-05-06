@@ -25,6 +25,7 @@ from roll.distributed.scheduler.protocol import (
     _profile_key,
     _record_profile_metrics,
     get_rollout_transfer_backend,
+    inherit_rollout_transfer_meta_info,
     pad_dataproto_to_divisor,
     unpad_dataproto,
 )
@@ -730,6 +731,7 @@ class DynamicSamplingScheduler(RolloutMockMixin):
 
         # DUMP MODE: Save merged batch (from mixin)
         await self._maybe_dump_batch(batch, global_step)
+        inherit_rollout_transfer_meta_info(batch.meta_info, self.meta_info or {})
 
         if self.pipeline_config.rollout_transfer_backend == "legacy":
             return batch

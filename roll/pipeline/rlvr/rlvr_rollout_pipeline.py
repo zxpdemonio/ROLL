@@ -12,7 +12,7 @@ from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from roll.datasets.collator import DataCollatorWithPaddingForPaddedKeys
 from roll.distributed.executor.cluster import Cluster
 from roll.distributed.scheduler.generate_scheduler import DynamicSamplingScheduler
-from roll.distributed.scheduler.protocol import DataProto, materialize_rollout_transfer
+from roll.distributed.scheduler.protocol import DataProto, materialize_rollout_transfer, set_rollout_transfer_meta_info
 from roll.models.model_providers import default_tokenizer_provider
 from roll.pipeline.base_pipeline import BasePipeline
 from roll.pipeline.rlvr.rlvr_config import RLVRConfig
@@ -127,6 +127,7 @@ class RLVRRolloutPipeline(RLVRPipeline):
         with Timer(name="step_generate", logger=None) as step_generate_timer:
             batch.meta_info["is_offload_states"] = False
             batch.meta_info["generation_config"] = self.pipeline_config.validation.generating_args.to_dict()
+            set_rollout_transfer_meta_info(batch.meta_info, self.pipeline_config)
             self.actor_infer.load_states()
             for reward_cluster in self.rewards.values():
                 reward_cluster.load_states()

@@ -775,7 +775,7 @@ class AsyncDynamicSamplingScheduler:
         request.batch["attention_mask"] = request.batch.pop("init_attention_mask", request.batch["attention_mask"])
         output_token_ids = data.meta_info["output_token_ids"]
         pre_output_token_ids = request.meta_info.pop("pre_output_token_ids", [[]] * len(output_token_ids))
-        output_token_ids = [pre_output_token_ids[i] + output_token_ids[i] for i in range(len(pre_output_token_ids))]
+        output_token_ids = [list(pre_output_token_ids[i]) + list(output_token_ids[i]) for i in range(len(pre_output_token_ids))]
 
         output_logprobs = data.meta_info.get("output_logprobs", None)
         if output_logprobs is not None:

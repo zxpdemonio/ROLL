@@ -12,7 +12,7 @@ from tqdm import tqdm
 from roll.configs.worker_config import WorkerConfig
 from roll.distributed.executor.worker import Worker
 from roll.distributed.scheduler.decorator import Dispatch, register
-from roll.distributed.scheduler.protocol import DataProto
+from roll.distributed.scheduler.protocol import DataProto, inherit_rollout_transfer_meta_info
 from roll.distributed.strategy.factory import create_strategy
 from roll.distributed.strategy.strategy import InferenceStrategy, TrainStrategy
 from roll.models.model_providers import (
@@ -150,6 +150,7 @@ class ActorWorker(Worker):
             output = output.to("cpu")
             data.to("cpu")
         output.meta_info = {"metrics": metrics}
+        inherit_rollout_transfer_meta_info(output.meta_info, data.meta_info)
         return output
 
     def forward_func_log_probs(self, data: DataProto, output_tensor: torch.Tensor):
@@ -161,7 +162,10 @@ class ActorWorker(Worker):
         log_probs = self.strategy.op_compute_log_probs(
             logits=output_tensor, input_ids=data.batch["input_ids"], attention_mask=data.batch["response_mask"]
         )
-        entropy = self.strategy.op_compute_entropy(logits=output_tensor, attention_mask=data.batch["response_mask"])
+        if self.pipeline_config.entropy_loss_coef > 0:
+            entropy = self.strategy.op_compute_entropy(logits=output_tensor, attention_mask=data.batch["response_mask"])
+        else:
+            entropy = torch.zeros_like(log_probs)
         return torch.tensor(0., device=output_tensor.device), {"log_probs": log_probs.clone().detach(), "entropy": entropy.clone().detach()}
 
     def get_old_log_probs_with_cache(self, data: DataProto, log_probs: torch.Tensor) -> torch.Tensor:
@@ -589,6 +593,7 @@ class CriticWorker(Worker):
             output = output.to("cpu")
 
         output.meta_info = {"metrics": metrics}
+        inherit_rollout_transfer_meta_info(output.meta_info, data.meta_info)
         return output
 
     @register(dispatch_mode=Dispatch.DP_MP_COMPUTE)
@@ -758,6 +763,7 @@ class RewardWorker(Worker):
             output = output.to("cpu")
 
         output.meta_info = {"metrics": metrics}
+        inherit_rollout_transfer_meta_info(output.meta_info, data.meta_info)
         return output
 
     def forward_func_values(self, data: DataProto, output_tensor: torch.Tensor):

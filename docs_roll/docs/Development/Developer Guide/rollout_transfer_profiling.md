@@ -75,6 +75,16 @@ python examples/start_rollout_transfer_benchmark.py \
 The shell wrapper at `examples/qwen3-vl-4B-rlvr_megatron/run_rollout_transfer_dual_node_benchmark.sh`
 adds the same defaults and makes Mooncake prefer RDMA by default for this benchmark path.
 
+## Troubleshooting
+
+For the Mooncake rollout transfer optimization summary and measured benchmark / full RL pipeline results, see:
+
+- [Mooncake rollout-transfer optimization report](rollout_transfer_mooncake_optimization_report.md)
+
+For Mooncake-specific runtime pitfalls, including binding/master ABI mismatches, stale Python extension modules, CUDA platform detection, RDMA segment sizing, and smoke-run preflight checks, see:
+
+- [Mooncake rollout-transfer troubleshooting notes](rollout_transfer_mooncake_troubleshooting.md)
+
 ## Notes
 
 - Profiling is opt-in and should stay disabled in normal training runs.

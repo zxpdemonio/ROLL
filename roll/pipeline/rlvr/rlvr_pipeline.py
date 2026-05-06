@@ -23,7 +23,7 @@ from roll.distributed.executor.cluster import Cluster
 from roll.configs.base_config import RouterArguments
 from roll.distributed.scheduler.generate_scheduler import DynamicSamplingScheduler
 from roll.distributed.scheduler.router import RouterManager
-from roll.distributed.scheduler.protocol import DataProto, materialize_rollout_transfer
+from roll.distributed.scheduler.protocol import DataProto, materialize_rollout_transfer, set_rollout_transfer_meta_info
 from roll.models.model_providers import default_tokenizer_provider
 from roll.pipeline.base_pipeline import BasePipeline
 from roll.utils.constants import RAY_NAMESPACE
@@ -467,8 +467,9 @@ class RLVRPipeline(BasePipeline):
                     meta_info={
                         "global_step": global_step,
                         "collect_unfinished": self.pipeline_config.async_pipeline,
-                        }
+                    }
                 )
+                set_rollout_transfer_meta_info(batch.meta_info, self.pipeline_config)
 
                 # 先model update，resume时不需要保存infer cluster的状态
                 if self.pipeline_config.adv_estimator == "gae":
@@ -810,6 +811,7 @@ class RLVRPipeline(BasePipeline):
                 "generation_config": self.pipeline_config.validation.generating_args.to_dict(),
                 "global_step": global_step,
             }
+            set_rollout_transfer_meta_info(batch.meta_info, self.pipeline_config)
 
             generate_output = materialize_rollout_transfer(
                 handle=ray.get(

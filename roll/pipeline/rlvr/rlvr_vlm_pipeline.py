@@ -24,7 +24,7 @@ from roll.datasets.collator import DataCollatorWithPaddingForMM
 from roll.datasets.dataset import get_dataset
 from roll.distributed.executor.cluster import Cluster
 from roll.distributed.scheduler.generate_scheduler import DynamicSamplingScheduler
-from roll.distributed.scheduler.protocol import DataProto, materialize_rollout_transfer
+from roll.distributed.scheduler.protocol import DataProto, materialize_rollout_transfer, set_rollout_transfer_meta_info
 from roll.models.model_providers import default_processor_provider, get_extra_data_provider
 from roll.pipeline.base_pipeline import BasePipeline
 from roll.pipeline.rlvr.rlvr_config import RLVRConfig
@@ -464,6 +464,7 @@ class RLVRVLMPipeline(BasePipeline):
                         "is_training": True,
                     }
                 )
+                set_rollout_transfer_meta_info(batch.meta_info, self.pipeline_config)
 
                 if self.pipeline_config.adv_estimator == "gae":
                     self.critic.offload_states(blocking=True)
@@ -734,6 +735,7 @@ class RLVRVLMPipeline(BasePipeline):
             batch.meta_info.update(
                 {"global_step": self.global_step, "max_steps": self.pipeline_config.max_steps, "is_training": False}
             )
+            set_rollout_transfer_meta_info(batch.meta_info, self.pipeline_config)
             generate_output = materialize_rollout_transfer(
                 handle=ray.get(
                     self.val_generate_scheduler.get_batch.remote(data=batch, global_step=global_step, batch_size=len(self.val_dataset)),

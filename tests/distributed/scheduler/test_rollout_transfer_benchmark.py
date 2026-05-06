@@ -67,6 +67,10 @@ def test_protocol_benchmark_reports_v1_metrics() -> None:
     assert stats["transfer/bytes/tensor"] > 0
     assert stats["transfer/sample_count"] == len(proto)
     assert stats["transfer/sequence_length/max"] == proto.batch["input_ids"].shape[-1]
+    assert stats["transfer/profile/time_seconds/encode_tensors"] >= 0
+    assert stats["transfer/profile/time_seconds/encode_non_tensors"] >= 0
+    assert stats["transfer/profile/time_seconds/encode_metadata"] >= 0
+    assert stats["transfer/profile/time_seconds/join_bulk_buffer"] >= 0
 
 
 def test_multimodal_dedup_benchmark_reduces_inline_payload_objects() -> None:
@@ -119,9 +123,13 @@ def test_ray_backend_benchmark_reports_round_trip_profile_metrics() -> None:
         assert metrics["transfer/time/put"] >= 0
         assert metrics["transfer/time/get"] >= 0
         assert metrics["transfer/time/deserialize"] >= 0
+        assert metrics["transfer/bytes/wire"] > 0
+        assert metrics["transfer/throughput/put_mbps"] >= 0
+        assert metrics["transfer/throughput/get_mbps"] >= 0
         assert metrics["transfer/profile/temp_buffer_count/to_transfer_payload"] >= 1.0
         assert metrics["transfer/profile/peak_rss_gb/to_transfer_payload"] > 0
         assert metrics["transfer/profile/peak_rss_gb/backend_get"] > 0
+        assert metrics["transfer/profile/time_seconds/decode_tensors"] >= 0
     finally:
         ray.shutdown()
 
@@ -135,12 +143,24 @@ def test_mooncake_backend_benchmark_reports_round_trip_profile_metrics() -> None
         restored = materialize_rollout_transfer(handle, backend_name="mooncake", protocol="v1")
 
         metrics = restored.meta_info["metrics"]
-        assert metrics["transfer/backend"] == "mooncake"
-        assert metrics["transfer/mooncake_transport_mode"] in {"store", "ray_bytes_fallback"}
+        assert metrics["transfer/backend/mooncake"] == 1.0
+        assert metrics["transfer/mooncake_transport/store"] in {0.0, 1.0}
+        assert metrics["transfer/mooncake_transport/ray_bytes_fallback"] in {0.0, 1.0}
         assert metrics["transfer/time/serialize"] >= 0
         assert metrics["transfer/time/put"] >= 0
         assert metrics["transfer/time/get"] >= 0
         assert metrics["transfer/time/deserialize"] >= 0
+        assert metrics["transfer/bytes/wire"] > 0
+        assert metrics["transfer/throughput/put_mbps"] >= 0
+        assert metrics["transfer/throughput/get_mbps"] >= 0
+        assert metrics["transfer/mooncake_rdma_requested"] in {0.0, 1.0}
+        if metrics["transfer/mooncake_transport/store"] == 1.0:
+            assert metrics["transfer/profile/buffer_count/backend_payload_multi_buffer"] >= 1.0
+            assert "transfer/profile/time_seconds/backend_payload_pickle" not in metrics
+            assert "transfer/profile/time_seconds/backend_payload_unpickle" not in metrics
+        else:
+            assert metrics["transfer/profile/time_seconds/backend_payload_pickle"] >= 0
+            assert metrics["transfer/profile/time_seconds/backend_payload_unpickle"] >= 0
         assert metrics["transfer/profile/temp_buffer_count/to_transfer_payload"] >= 1.0
     finally:
         ray.shutdown()

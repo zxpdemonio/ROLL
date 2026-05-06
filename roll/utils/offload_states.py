@@ -1,10 +1,21 @@
 from enum import Enum
-from typing import List, Tuple, Union
+from typing import List, Optional, Tuple, Type, Union
 
 import torch
 from torch import Tensor
 from transformers import PreTrainedModel
 from roll.platforms import current_platform
+
+
+ValueHeadModelType = Optional[Type[torch.nn.Module]]
+
+
+def _get_trl_value_head_cls() -> ValueHeadModelType:
+    try:
+        from trl import AutoModelForCausalLMWithValueHead
+    except (AttributeError, ImportError):
+        return None
+    return AutoModelForCausalLMWithValueHead
 
 
 class OffloadStateType(str, Enum):
@@ -21,8 +32,8 @@ def offload_hf_model(model: PreTrainedModel):
     """
     根据 hf_device_map 将模型的各个层卸载到 CPU
     """
-    from trl import AutoModelForCausalLMWithValueHead
-    if isinstance(model, AutoModelForCausalLMWithValueHead):
+    value_head_cls = _get_trl_value_head_cls()
+    if value_head_cls is not None and isinstance(model, value_head_cls):
         offload_hf_model(model=model.pretrained_model)
         offload_hf_model(model=model.v_head)
         return
@@ -37,8 +48,8 @@ def load_hf_model(model: PreTrainedModel):
     """
     根据 hf_device_map 将模型的各个层卸载到 对应的GPU
     """
-    from trl import AutoModelForCausalLMWithValueHead
-    if isinstance(model, AutoModelForCausalLMWithValueHead):
+    value_head_cls = _get_trl_value_head_cls()
+    if value_head_cls is not None and isinstance(model, value_head_cls):
         load_hf_model(model=model.pretrained_model)
         load_hf_model(model=model.v_head)
         return
