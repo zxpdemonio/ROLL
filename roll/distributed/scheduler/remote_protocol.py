@@ -537,6 +537,250 @@ class RowRemoteBatch(RemoteBatch):
         )
 
 
+class MooncakeRemoteBatch(RowRemoteBatch):
+    def __init__(
+        self,
+        partition: str,
+        device,
+        fields,
+        row_ids: list[str],
+        handle: dict[str, Any] | list[dict[str, Any]],
+        rows: list[int] | None,
+        owns_ref: bool,
+        cache: TensorDict,
+    ):
+        super().__init__(partition=partition, device=device, fields=fields, row_ids=row_ids, cache=cache)
+        if isinstance(handle, list):
+            self.segments = []
+            for segment in handle:
+                copied = dict(segment)
+                copied.setdefault("rows", None)
+                copied.setdefault("row_ids", row_ids.copy())
+                copied.setdefault("owns_ref", False)
+                self.segments.append(copied)
+        else:
+            self.segments = [
+                {
+                    "handle": handle.copy(),
+                    "rows": None if rows is None else list(rows),
+                    "row_ids": row_ids.copy(),
+                    "owns_ref": owns_ref,
+                }
+            ]
+        self.handle = self.segments[0]["handle"]
+        self.rows = self.segments[0]["rows"] if len(self.segments) == 1 else None
+        self.owns_ref = any(segment.get("owns_ref", False) for segment in self.segments)
+
+    def __reduce__(self):
+        return (
+            MooncakeRemoteBatch,
+            (self.partition, self.device, self.fields, self._row_ids, self.segments, None, self.owns_ref, None),
+        )
+
+    def clone(self, recurse: bool = True):
+        segments = []
+        for segment in self.segments:
+            copied = dict(segment)
+            copied["owns_ref"] = False
+            segments.append(copied)
+        return MooncakeRemoteBatch(
+            partition=self.partition,
+            device=self.device,
+            fields=self.fields.copy(),
+            row_ids=self._row_ids.copy(),
+            handle=segments,
+            rows=None,
+            owns_ref=False,
+            cache=self.cache.clone(recurse=recurse) if self.cache is not None else None,
+        )
+
+    def materialize(self, fields: list[str] = None) -> TensorDict:
+        if fields is None:
+            fields = self.fields
+        else:
+            assert set(fields) <= self.fields, f"Fields {set(fields)} is not subset of {self.fields}"
+        existing_fields = set(self.cache.keys()) if self.cache is not None else set()
+        fetch_fields = [field for field in fields if field not in existing_fields]
+        if len(fetch_fields) > 0:
+            with Timer(name="remote_batch_materialize", logger=None) as timer:
+                data: TensorDict = transfer_backend.get(
+                    partition=self.partition,
+                    keys=self._row_ids,
+                    fields=fetch_fields,
+                    segments=self.segments,
+                )
+                assert set(data.keys()) == set(fetch_fields)
+                if self.cache is None:
+                    self.cache = data
+                else:
+                    from roll.distributed.scheduler.protocol import union_tensor_dict
+
+                    self.cache = union_tensor_dict(self.cache, data)
+                if self.device is not None:
+                    self.cache.to(self.device)
+            logger.info(
+                f"MooncakeRemoteBatch materialize cost {timer.last}s, partition={self.partition}, "
+                f"new materialized {sorted(fetch_fields)}, cached fields {sorted(list(existing_fields))}"
+            )
+        return self.cache.select(*fields)
+
+    def drop(self):
+        transfer_backend.delete(
+            partition=self.partition,
+            keys=self._row_ids,
+            fields=list(self.fields),
+            segments=self.segments,
+            owns_ref=self.owns_ref,
+        )
+
+    def select(self, fileds: list[str]) -> "MooncakeRemoteBatch":
+        selected = super().select(fileds)
+        return MooncakeRemoteBatch(
+            partition=selected.partition,
+            device=selected.device,
+            fields=selected.fields,
+            row_ids=selected._row_ids,
+            handle=[dict(segment) for segment in self.segments],
+            rows=None,
+            owns_ref=False,
+            cache=selected.cache,
+        )
+
+    def select_idxs(self, index: torch.Tensor | np.ndarray | list) -> "MooncakeRemoteBatch":
+        selected = super().select_idxs(index)
+        index_list = self._index_to_list(index)
+        return MooncakeRemoteBatch(
+            partition=selected.partition,
+            device=selected.device,
+            fields=selected.fields,
+            row_ids=selected._row_ids,
+            handle=self._select_segments(index_list),
+            rows=None,
+            owns_ref=False,
+            cache=selected.cache,
+        )
+
+    def slice(
+        self,
+        start: Optional[int] = None,
+        end: Optional[int] = None,
+        step: Optional[int] = None,
+    ) -> "MooncakeRemoteBatch":
+        selected = super().slice(start=start, end=end, step=step)
+        selected_indices = list(range(len(self)))[slice(start, end, step)]
+        return MooncakeRemoteBatch(
+            partition=selected.partition,
+            device=selected.device,
+            fields=selected.fields,
+            row_ids=selected._row_ids,
+            handle=self._select_segments(selected_indices),
+            rows=None,
+            owns_ref=False,
+            cache=selected.cache,
+        )
+
+    def pop(self, filed) -> "MooncakeRemoteBatch":
+        selected = self.select(filed)
+        self.fields -= set(filed)
+        if self.cache is not None:
+            remaining_keys = [k for k in self.fields if k in self.cache.keys()]
+            self.cache = self.cache.select(*remaining_keys) if remaining_keys else None
+        return selected
+
+    def chunk(self, chunk_sizes: list[int]) -> list["MooncakeRemoteBatch"]:
+        assert sum(chunk_sizes) == len(
+            self
+        ), f"Sum of chunk_sizes {sum(chunk_sizes)} does not match batch size {len(self)}"
+        chunks = []
+        offset = 0
+        for size in chunk_sizes:
+            chunks.append(self.slice(offset, offset + size))
+            offset += size
+        return chunks
+
+    def repeat(self, repeat_times: int, interleave: bool) -> "MooncakeRemoteBatch":
+        selected = super().repeat(repeat_times=repeat_times, interleave=interleave)
+        base_indices = list(range(len(self)))
+        if interleave:
+            selected_indices = [index for index in base_indices for _ in range(repeat_times)]
+        else:
+            selected_indices = base_indices * repeat_times
+        return MooncakeRemoteBatch(
+            partition=selected.partition,
+            device=selected.device,
+            fields=selected.fields,
+            row_ids=selected._row_ids,
+            handle=self._select_segments(selected_indices),
+            rows=None,
+            owns_ref=False,
+            cache=selected.cache,
+        )
+
+    def union(self, rhs: "RemoteBatch") -> "MooncakeRemoteBatch":
+        assert isinstance(rhs, MooncakeRemoteBatch), f"MooncakeRemoteBatch can only union MooncakeRemoteBatch, got {type(rhs)}"
+        assert self._row_ids == rhs._row_ids, f"Row ids must match for union. Got {self._row_ids} and {rhs._row_ids}"
+        if len(self.segments) == len(rhs.segments) == 1:
+            rhs.segments[0]["owns_ref"] = False
+        super().union(rhs)
+        return self
+
+    @classmethod
+    def _cat(cls, data: list["MooncakeRemoteBatch"]) -> "MooncakeRemoteBatch":
+        assert data
+        if len(data) == 1:
+            return data[0].clone()
+        row_remote_batch = RowRemoteBatch._cat(data)
+        segments = []
+        for batch in data:
+            segments.extend(dict(segment) for segment in batch.segments)
+        return MooncakeRemoteBatch(
+            partition=row_remote_batch.partition,
+            device=row_remote_batch.device,
+            fields=row_remote_batch.fields,
+            row_ids=row_remote_batch._row_ids,
+            handle=segments,
+            rows=None,
+            owns_ref=False,
+            cache=row_remote_batch.cache,
+        )
+
+    def _select_segments(self, index_list: list[int] | list[bool]) -> list[dict[str, Any]]:
+        if index_list and isinstance(index_list[0], bool):
+            positions = [index for index, mask in enumerate(index_list) if mask]
+        else:
+            positions = [index if index >= 0 else len(self) + index for index in index_list]
+        row_id_to_segment = {}
+        for segment in self.segments:
+            segment_rows = list(range(len(segment["row_ids"]))) if segment["rows"] is None else segment["rows"]
+            for row_id, row in zip(segment["row_ids"], segment_rows):
+                row_id_to_segment[row_id] = (segment, row)
+        grouped = []
+        for position in positions:
+            row_id = self._row_ids[position]
+            segment, row = row_id_to_segment[row_id]
+            if grouped and grouped[-1]["handle"] == segment["handle"]:
+                grouped[-1]["rows"].append(row)
+                grouped[-1]["row_ids"].append(row_id)
+            else:
+                grouped.append(
+                    {
+                        "handle": segment["handle"],
+                        "rows": [row],
+                        "row_ids": [row_id],
+                        "owns_ref": False,
+                    }
+                )
+        return grouped
+
+    @staticmethod
+    def _index_to_list(index: torch.Tensor | np.ndarray | list) -> list:
+        if isinstance(index, np.ndarray):
+            return index.tolist()
+        if isinstance(index, list):
+            return index
+        return index.tolist()
+
+
 class PlanNode(ABC):
     def __init__(self):
         pass

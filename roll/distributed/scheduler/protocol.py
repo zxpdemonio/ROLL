@@ -1149,13 +1149,25 @@ class DataProto:
             assert isinstance(partition, str)
             partition = data._remote_batch.partition if data._remote_batch is not None else partition
 
-            data_dict: dict = data._batch.to_dict() if data._batch is not None else {}
-            data_dict.update(data._non_tensor_batch)
+            batch_fields: dict = data._batch.to_dict() if data._batch is not None else {}
+            non_tensor_fields: dict = data._non_tensor_batch
+            data_dict: dict = dict(batch_fields)
+            data_dict.update(non_tensor_fields)
 
             if not data_dict:
                 return data
 
-            remote_batch = transfer_backend.put(partition, row_ids, data_dict, batch_size)
+            ref_remote_batch = data._remote_batch
+
+            remote_batch = transfer_backend.put(
+                partition,
+                row_ids,
+                data_dict,
+                batch_size,
+                batch_fields=batch_fields,
+                non_tensor_fields=non_tensor_fields,
+                ref_remote_batch=ref_remote_batch,
+            )
             if remote_batch is None: # transfer backend is not available
                 assert data._remote_batch is None
                 return data
