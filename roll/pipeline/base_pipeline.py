@@ -14,6 +14,7 @@ from roll.distributed.executor.cluster import Cluster
 from roll.distributed.executor.model_update_group import ModelUpdateGroup
 from roll.distributed.scheduler.protocol import DataProto
 from roll.distributed.scheduler.resource_manager import ResourceManager
+from roll.distributed.scheduler.transfer_backend import init_transfer_backend
 from roll.utils.checkpoint_manager import CheckpointManager, download_model
 from roll.utils.functionals import reduce_metrics
 from roll.utils.logging import get_logger
@@ -40,6 +41,7 @@ class BasePipeline:
             config=self.pipeline_config.to_dict(),
             **self.pipeline_config.tracker_kwargs,
         )
+        init_transfer_backend(self.pipeline_config.transfer_backend)
         self.resume_from_checkpoint = False
         self.executor: futures.ThreadPoolExecutor = futures.ThreadPoolExecutor(max_workers=5)
         self.resume_futures = []

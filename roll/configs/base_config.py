@@ -30,6 +30,20 @@ class RolloutMockConfig:
     )
 
 @dataclass
+class TransferBackendArguments:
+    """Configuration for rollout data transfer backend."""
+
+    backend_name: Optional[str] = field(
+        default=None,
+        metadata={"help": "The registered backend for transfer."}
+    )
+    backend_config: Dict = field(
+        default_factory=dict,
+        metadata={"help": "Configuration dictionary for the backend."}
+    )
+
+
+@dataclass
 class RouterArguments:
     router_name: Literal[
         "PromptAffinityRouter",
@@ -243,7 +257,10 @@ class BaseConfig(ScheduleConfig):
         default=None,
         metadata={"help": "Rollout mock configuration for precision alignment testing."}
     )
-
+    transfer_backend: Optional[TransferBackendArguments] = field(
+        default=None,
+        metadata={"help": "Transfer backend configuration."}
+    )
 
     def to_dict(self):
         return dataclasses.asdict(self)
