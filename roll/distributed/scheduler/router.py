@@ -22,6 +22,11 @@ from roll.models.model_providers import default_tokenizer_provider
 from roll.utils.functionals import gather_unpadded_input_ids
 from roll.utils.checkpoint_manager import download_model
 from roll.utils.logging import get_logger
+from roll.utils.execution_artifacts import (
+    ATTENTION_SELECTION_KEY,
+    ATTENTION_SELECTION_PROFILE_KEY,
+    EXECUTION_ARTIFACT_PROFILE_ID_KEY,
+)
 
 
 logger = get_logger()
@@ -663,6 +668,13 @@ class RouterClient:
             # For the 30A3 model, this data block is tens of MB in size.
             # The serialization overhead of Ray transmission needs to be profiled again.
             output_data.meta_info["routed_experts"] = response.get("routed_experts", None)
+            for key in (
+                ATTENTION_SELECTION_KEY,
+                ATTENTION_SELECTION_PROFILE_KEY,
+                EXECUTION_ARTIFACT_PROFILE_ID_KEY,
+            ):
+                if key in response:
+                    output_data.meta_info[key] = response[key]
             output_data.meta_info["eos_token_id"] = [self.eos_token_id, self.pad_token_id]
             output_data.meta_info["pad_token_id"] = self.pad_token_id
 

@@ -33,6 +33,12 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.utils import kill_process_tree
 from roll.utils.functionals import concatenate_input_and_output, gather_unpadded_input_ids
 from roll.utils.logging import get_logger
+from roll.utils.execution_artifacts import (
+    ATTENTION_SELECTION_KEY,
+    ATTENTION_SELECTION_PROFILE_KEY,
+    EXECUTION_ARTIFACT_PROFILE_ID_KEY,
+    decode_attention_selection,
+)
 from roll.utils.network_utils import collect_free_port
 from roll.utils.offload_states import OffloadStateType, clear_memory
 from roll.platforms import current_platform
@@ -72,6 +78,9 @@ class SgLangStrategy(InferenceStrategy):
 
     async def initialize(self, model_provider):
         set_seed(seed=self.worker.pipeline_config.seed)
+        self.attention_selection_profile = self.worker_config.attention_selection_profile
+        if self.attention_selection_profile is not None:
+            self.attention_selection_profile.validate_producer("sglang")
 
         sglang_config = copy.deepcopy(self.worker_config.strategy_args.strategy_config)
         tp_size = sglang_config.pop("tensor_parallel_size", len(self.worker_config.resource_placement_groups))
@@ -123,6 +132,12 @@ class SgLangStrategy(InferenceStrategy):
                 "enable_return_routed_experts": self.enable_rollout_routing_replay,
             }
         )
+        if self.attention_selection_profile is not None:
+            sglang_config["enable_return_indexer_topk"] = True
+            logger.info(
+                "Sparse attention selection capture enabled with profile %s",
+                self.attention_selection_profile.profile_id,
+            )
 
         if nnodes > 1:
             sglang_config['dist_init_addr'] = f'{ray.util.get_node_ip_address()}:{collect_free_port()}'
@@ -203,6 +218,8 @@ class SgLangStrategy(InferenceStrategy):
             payload["return_routed_experts"] = True
         else:
             payload["return_routed_experts"] = False
+        if self.attention_selection_profile is not None:
+            payload["return_indexer_topk"] = True
 
         if "multi_modal_data" in payload:
             multi_modal_data = payload["multi_modal_data"]
@@ -232,15 +249,18 @@ class SgLangStrategy(InferenceStrategy):
             image_data = None
             video_data = None
 
-        obj = GenerateReqInput(
+        request_kwargs = dict(
             input_ids=input_ids,
             sampling_params=payload["sampling_params"],
             rid=payload["rid"],
             return_logprob=payload["return_logprob"],
             return_routed_experts=payload["return_routed_experts"],
             image_data=image_data,
-            video_data=video_data
+            video_data=video_data,
         )
+        if self.attention_selection_profile is not None:
+            request_kwargs["return_indexer_topk"] = True
+        obj = GenerateReqInput(**request_kwargs)
         generator = self.model.engine.tokenizer_manager.generate_request(obj, None)
         chunks = None
         async for chunks in generator:
@@ -248,7 +268,7 @@ class SgLangStrategy(InferenceStrategy):
         assert chunks is not None
         chunks = chunks if isinstance(chunks, list) else [chunks]
 
-        return postprocess_generate(chunks)
+        return postprocess_generate(chunks, self.attention_selection_profile)
 
     async def generate(self, batch: DataProto, generation_config):
         # assert isinstance(self.model, SglangEngine)
@@ -593,7 +613,7 @@ def create_sampling_params_for_sglang(gen_kwargs: dict):
         no_stop_trim=gen_kwargs.get("include_stop_str_in_output", True),
     )
 
-def postprocess_generate(chunks):
+def postprocess_generate(chunks, attention_selection_profile=None):
     output_data = {}
     output_token_ids = [chunk.get("output_ids", []) for chunk in chunks]
     output_logprobs = [chunk["meta_info"].get("output_token_logprobs", None) for chunk in chunks]
@@ -614,6 +634,30 @@ def postprocess_generate(chunks):
     has_routed_experts = any(routed_experts is not None for routed_experts in output_routed_experts)
     if has_routed_experts:
         output_data["routed_experts"] = output_routed_experts
+
+    if attention_selection_profile is not None:
+        output_attention_selection = []
+        for chunk in chunks:
+            meta_info = chunk["meta_info"]
+            raw_selection = meta_info.get("indexer_topk")
+            if raw_selection is None:
+                raise RuntimeError(
+                    "attention_selection_profile is configured but SGLang returned no indexer_topk"
+                )
+            returned_layers = meta_info.get("indexer_topk_num_layers")
+            if returned_layers is None:
+                raise ValueError("SGLang returned indexer_topk without indexer_topk_num_layers")
+            if returned_layers != attention_selection_profile.num_layers:
+                raise ValueError(
+                    f"SGLang indexer_topk_num_layers {returned_layers} != profile num_layers "
+                    f"{attention_selection_profile.num_layers}"
+                )
+            output_attention_selection.append(
+                decode_attention_selection(raw_selection, attention_selection_profile)
+            )
+        output_data[ATTENTION_SELECTION_KEY] = output_attention_selection
+        output_data[EXECUTION_ARTIFACT_PROFILE_ID_KEY] = attention_selection_profile.profile_id
+        output_data[ATTENTION_SELECTION_PROFILE_KEY] = attention_selection_profile
 
     # Speculative decoding metrics keys from sglang
     spec_metric_keys = [

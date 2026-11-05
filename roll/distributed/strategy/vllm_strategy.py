@@ -36,6 +36,12 @@ from roll.utils.logging import get_logger
 from roll.utils.offload_states import OffloadStateType, clear_memory
 from roll.platforms import current_platform
 from roll.utils.constants import RAY_NAMESPACE
+from roll.utils.execution_artifacts import (
+    ATTENTION_SELECTION_KEY,
+    ATTENTION_SELECTION_PROFILE_KEY,
+    EXECUTION_ARTIFACT_PROFILE_ID_KEY,
+    decode_attention_selection,
+)
 
 
 logger = get_logger()
@@ -184,6 +190,9 @@ class VllmStrategy(InferenceStrategy):
     async def initialize(self, model_provider):
         set_seed(seed=self.worker.pipeline_config.seed)
         vllm_config = copy.deepcopy(self.worker_config.strategy_args.strategy_config)
+        self.attention_selection_profile = self.worker_config.attention_selection_profile
+        if self.attention_selection_profile is not None:
+            self.attention_selection_profile.validate_producer("vllm")
 
         # Apply GDN attention patch for mixed decode/spec-decode bug fix
         # This patches vLLM versions < v0.17.2 that lack the fix
@@ -351,6 +360,13 @@ class VllmStrategy(InferenceStrategy):
             vllm_config["enable_return_routed_experts"] = True
             logger.info(
                 f"{self.enable_rollout_routing_replay=} and {self.worker_config.router_replay.mode=}"
+            )
+
+        if self.attention_selection_profile is not None:
+            vllm_config["enable_return_indexer_topk"] = True
+            logger.info(
+                "Sparse attention selection capture enabled with profile %s",
+                self.attention_selection_profile.profile_id,
             )
 
         logger.info(f"vllm_config: {vllm_config}")
@@ -554,6 +570,7 @@ class VllmStrategy(InferenceStrategy):
 
         output_token_ids, finish_reasons, logprobs = [], [], []
         routed_experts = []
+        attention_selections = []
         if "multi_modal_data" in payload:
             # Use expanded_prompt_len (vision tokens expanded) for R3 slicing; prompt_token_ids are text-only.
             prompt_len = payload.get("expanded_prompt_len", len(payload["multi_modal_data"]["prompt_token_ids"]))
@@ -585,6 +602,26 @@ class VllmStrategy(InferenceStrategy):
                 re = re[:expected_rows]
             routed_experts.append(re)
 
+            if self.attention_selection_profile is not None:
+                raw_selection = getattr(completion_output, "indexer_topk", None)
+                if raw_selection is None:
+                    raise RuntimeError(
+                        "attention_selection_profile is configured but vLLM returned no indexer_topk"
+                    )
+                returned_layers = getattr(completion_output, "indexer_topk_num_layers", None)
+                if returned_layers is not None and returned_layers != self.attention_selection_profile.num_layers:
+                    raise ValueError(
+                        f"vLLM indexer_topk_num_layers {returned_layers} != profile num_layers "
+                        f"{self.attention_selection_profile.num_layers}"
+                    )
+                attention_selections.append(
+                    decode_attention_selection(
+                        raw_selection,
+                        self.attention_selection_profile,
+                        expected_rows=expected_rows,
+                    )
+                )
+
         result = {
             "output_token_ids": output_token_ids,
             "finish_reasons": finish_reasons,
@@ -594,6 +631,11 @@ class VllmStrategy(InferenceStrategy):
         # Mirroring sglang_strategy.
         if any(re is not None for re in routed_experts):
             result["routed_experts"] = routed_experts
+
+        if self.attention_selection_profile is not None:
+            result[ATTENTION_SELECTION_KEY] = attention_selections
+            result[EXECUTION_ARTIFACT_PROFILE_ID_KEY] = self.attention_selection_profile.profile_id
+            result[ATTENTION_SELECTION_PROFILE_KEY] = self.attention_selection_profile
 
         # Add speculative metrics if available
         spec_metrics = self.get_speculative_metrics()

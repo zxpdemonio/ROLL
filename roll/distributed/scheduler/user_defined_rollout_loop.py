@@ -20,6 +20,11 @@ from roll.utils.functionals import (
 )
 from roll.utils.telemetry import get_tracer
 from roll.utils.logging import get_logger
+from roll.utils.execution_artifacts import (
+    ATTENTION_SELECTION_KEY,
+    ATTENTION_SELECTION_PROFILE_KEY,
+    EXECUTION_ARTIFACT_PROFILE_ID_KEY,
+)
 
 
 logger = get_logger()
@@ -198,6 +203,18 @@ class UserDefinedRolloutLoop:
                 # [B*S1, num_expert, topk] + [B*S2, num_expert, topk] -> [B*(S1+S2), num_expert, topk]
                 routed_experts = torch.cat([pre_routed_experts, routed_experts], dim=0)
 
+        attention_selection = data.meta_info.get(ATTENTION_SELECTION_KEY)
+        attention_selection_profile = data.meta_info.get(ATTENTION_SELECTION_PROFILE_KEY)
+        attention_selection_profile_id = data.meta_info.get(EXECUTION_ARTIFACT_PROFILE_ID_KEY)
+        if attention_selection is not None:
+            if attention_selection_profile is None or attention_selection_profile_id is None:
+                raise ValueError("attention selection requires both profile and profile_id")
+            if attention_selection_profile.profile_id != attention_selection_profile_id:
+                raise ValueError(
+                    f"attention selection profile_id {attention_selection_profile_id} does not match "
+                    f"profile {attention_selection_profile.profile_id}"
+                )
+
         output_tokens = [torch.tensor(token_ids) for token_ids in output_token_ids]
         output_tensor = pad_sequence(output_tokens, batch_first=True, padding_value=pad_token_id)
         output_tensor = concatenate_input_and_output(
@@ -212,10 +229,14 @@ class UserDefinedRolloutLoop:
             pad_token_id=pad_token_id,
             output_logprobs=output_logprobs,
             routed_experts=routed_experts,
+            attention_selection=attention_selection,
+            attention_selection_profile=attention_selection_profile,
         )
         request_repeat = request.repeat(repeat_times=len(output_tokens))
         output.non_tensor_batch = request_repeat.non_tensor_batch
         output.meta_info = request_repeat.meta_info
+        if attention_selection is not None:
+            output.meta_info[EXECUTION_ARTIFACT_PROFILE_ID_KEY] = attention_selection_profile_id
         # Preserve metrics from data (e.g., speculative decoding metrics)
         if "metrics" in data.meta_info:
             output.meta_info.setdefault("metrics", {}).update(data.meta_info["metrics"])

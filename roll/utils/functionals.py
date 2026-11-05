@@ -24,6 +24,12 @@ from roll.pipeline.rlvr.rlvr_config import RLVRConfig
 from roll.platforms import current_platform
 from roll.utils.kl_controller import AdaptiveKLController
 from roll.utils.logging import get_logger
+from roll.utils.execution_artifacts import (
+    ATTENTION_SELECTION_KEY,
+    ATTENTION_SELECTION_VALID_COUNT_KEY,
+    AttentionSelectionProfile,
+    pack_attention_selection,
+)
 
 logger = get_logger()
 
@@ -1727,6 +1733,8 @@ def postprocess_generate(
     fill_eos_token=False,
     output_logprobs: Optional[list[list[float]]] = None,
     routed_experts: Optional[list[torch.Tensor]]=None,
+    attention_selection: Optional[list[torch.Tensor]] = None,
+    attention_selection_profile: Optional[AttentionSelectionProfile] = None,
     num_moe_experts: Optional[int]=None,
     pad_to_seq_len=True,
 ) -> "DataProto":
@@ -1807,6 +1815,7 @@ def postprocess_generate(
         else None
     )
 
+    attention_valid_counts = []
     for i in range(output_batch_size):
         shift = first_one[i].item()
         if shift > 0:
@@ -1831,6 +1840,8 @@ def postprocess_generate(
             # rows with distinct expert indices to keep routing_map dense. This is safe since padding is masked from loss.
             if valid_length - 1 < sequence_length:
                 new_routed_experts[i, valid_length - 1 :] = torch.arange(topk, dtype=expert_dtype).view(1, 1, topk)
+        if attention_selection is not None:
+            attention_valid_counts.append(valid_length - 1)
         if position_ids.dim() == 3 and shift > 0:
             # shift as output to convert to right padding
             # NOTE: left shift without clear right might lead to unclean values
@@ -1869,6 +1880,17 @@ def postprocess_generate(
         batch["infer_logprobs"] = logprobs
     if new_routed_experts is not None:
         batch["routed_experts"] = new_routed_experts
+    if attention_selection is not None:
+        if attention_selection_profile is None:
+            raise ValueError("attention_selection_profile is required when attention_selection is present")
+        packed_selection, valid_counts = pack_attention_selection(
+            attention_selection,
+            attention_valid_counts,
+            sequence_length,
+            attention_selection_profile,
+        )
+        batch[ATTENTION_SELECTION_KEY] = packed_selection
+        batch[ATTENTION_SELECTION_VALID_COUNT_KEY] = valid_counts
     return DataProto(batch=batch)
 
 

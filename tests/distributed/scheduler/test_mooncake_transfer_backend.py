@@ -222,7 +222,10 @@ def test_mooncake_client_uses_unified_dataproto_api(monkeypatch):
         def get(self, ref, **kwargs):
             calls.append(("get", kwargs, ref))
             return {
-                "batch": {"tokens": torch.tensor([[1], [2]])},
+                "batch": {
+                    "tokens": torch.tensor([[1], [2]]),
+                    "attention_selection": torch.arange(2 * 3 * 2 * 4, dtype=torch.int32).reshape(2, 3, 2, 4),
+                },
                 "non_tensor_batch": {"prompt": np.array(["a", "b"], dtype=object)},
             }
 
@@ -263,16 +266,22 @@ def test_mooncake_client_uses_unified_dataproto_api(monkeypatch):
     )
 
     prompt = np.array(["a", "b"], dtype=object)
+    attention_selection = torch.arange(2 * 3 * 2 * 4, dtype=torch.int32).reshape(2, 3, 2, 4)
     remote = client.put(
         "rollout",
         ["0", "1"],
         {
             "tokens": torch.tensor([[1], [2]]),
+            "attention_selection": attention_selection,
             "prompt": prompt,
         },
         batch_size=2,
     )
-    materialized = client.get("rollout", ["tokens", "prompt"], [remote.fields["tokens"], remote.fields["prompt"]])
+    materialized = client.get(
+        "rollout",
+        ["tokens", "attention_selection", "prompt"],
+        [remote.fields["tokens"], remote.fields["attention_selection"], remote.fields["prompt"]],
+    )
 
     put_name, put_kwargs, put_data = calls[0]
     get_name, get_kwargs, get_ref = calls[1]
@@ -283,19 +292,21 @@ def test_mooncake_client_uses_unified_dataproto_api(monkeypatch):
     assert schema.codec == "ragged_tensor_dict"
     assert schema.metadata == {"section": "non_tensor_batch", "keys": {"image": None}}
     assert put_data["meta_info"] == {}
-    assert set(put_data["batch"]) == {"tokens"}
+    assert set(put_data["batch"]) == {"tokens", "attention_selection"}
     assert set(put_data["non_tensor_batch"]) == {"prompt"}
     assert put_data["non_tensor_batch"]["prompt"] is prompt
     assert get_name == "get"
     assert get_ref == "ref"
     assert get_kwargs == {
         "type": "dataproto",
-        "batch_fields": ["tokens"],
+        "batch_fields": ["tokens", "attention_selection"],
         "non_tensor_fields": ["prompt"],
         "meta_info_keys": [],
         "data_cls": dict,
     }
     assert torch.equal(materialized["tokens"], torch.tensor([[1], [2]]))
+    assert torch.equal(materialized["attention_selection"], attention_selection)
+    assert materialized["attention_selection"].is_contiguous()
     assert list(materialized["prompt"]) == ["a", "b"]
 
     client.release(materialized)

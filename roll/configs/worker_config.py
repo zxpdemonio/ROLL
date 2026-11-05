@@ -3,6 +3,7 @@ from typing import Dict, List, Literal, Optional, Union
 
 from roll.configs import DataArguments, GeneratingArguments, ModelArguments
 from roll.configs.training_args import TrainingArguments
+from roll.utils.execution_artifacts import AttentionSelectionProfile
 from roll.utils.logging import get_logger
 logger = get_logger()
 
@@ -250,6 +251,13 @@ class WorkerConfig:
         metadata={
             "help": "Configuration for router replay in training. Only supported for Megatron strategy."
         }
+    )
+
+    attention_selection_profile: Optional[AttentionSelectionProfile] = field(
+        default=None,
+        metadata={
+            "help": "Job-level sparse-attention selection profile. None disables capture and replay transport."
+        },
     )
 
     apply_loss_scale: bool = field(
