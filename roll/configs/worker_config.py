@@ -259,6 +259,15 @@ class WorkerConfig:
             "help": "Job-level sparse-attention selection profile. None disables capture and replay transport."
         },
     )
+    attention_selection_max_bytes: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional vLLM per-output-worker SHM budget for persistent sparse-attention auxiliary output. "
+                "This is a KV-block store capacity, not the ROLL in-flight request budget."
+            )
+        },
+    )
 
     apply_loss_scale: bool = field(
         default=True,
@@ -361,6 +370,14 @@ class WorkerConfig:
                         f"but current strategy is {self.strategy_args.strategy_name}. "
                         f"router_replay will be ignored."
                     )
+
+            if self.attention_selection_profile is not None and self.attention_selection_max_bytes is not None:
+                if self.attention_selection_max_bytes <= 0:
+                    raise ValueError(
+                        "attention_selection_max_bytes must be positive when configured"
+                    )
+                if self.strategy_args.strategy_name not in {"vllm", "vllm_omni"}:
+                    raise ValueError("attention_selection_max_bytes is only supported by vLLM")
 
         if self.device_mapping is not None:
             if isinstance(self.device_mapping, str):

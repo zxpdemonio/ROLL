@@ -5,6 +5,9 @@ import pytest
 import torch
 from tensordict import TensorDict
 
+from roll.configs import GeneratingArguments
+from roll.configs.base_config import PPOConfig
+from roll.configs.worker_config import StrategyArguments, WorkerConfig
 from roll.distributed.scheduler.protocol import DataProto
 from roll.utils.execution_artifacts import (
     AttentionSelectionProfile,
@@ -25,6 +28,26 @@ def profile():
     )
 
 
+def make_vllm_raw_profile(profile, sources=None):
+    if sources is None:
+        sources = [
+            {
+                "layer_id": layer,
+                "shape": [profile.topk],
+                "semantic": "logical_token_id",
+                "codec": "int32",
+            }
+            for layer in range(profile.num_layers)
+        ]
+    return {
+        "kind": "indexer",
+        "codec_version": 1,
+        "model_identity": "test-model-identity",
+        "storage_dtype": "int32",
+        "sources": sources,
+    }
+
+
 def test_profile_estimates_top2048_payload_bytes():
     top2048 = AttentionSelectionProfile(
         profile_id="deepseek-v3.2-dsa-top2048-v1",
@@ -36,11 +59,130 @@ def test_profile_estimates_top2048_payload_bytes():
 
     assert top2048.row_width == 12_288
     assert top2048.estimate_payload_bytes(num_tokens=128, batch_size=2) == 12_582_912
+    assert top2048.estimate_packed_bytes(num_tokens=128, batch_size=2) == 12_582_920
+    assert top2048.max_concurrent_requests(num_tokens=128, max_bytes=25_165_824) == 4
+
+
+def test_profile_rejects_non_positive_capacity(profile):
+    with pytest.raises(ValueError, match="max_bytes must be positive"):
+        profile.max_concurrent_requests(num_tokens=128, max_bytes=0)
+
+
+def test_worker_rejects_non_positive_vllm_store_budget(profile):
+    with pytest.raises(ValueError, match="attention_selection_max_bytes"):
+        WorkerConfig(
+            strategy_args=StrategyArguments(strategy_name="vllm"),
+            attention_selection_profile=profile,
+            attention_selection_max_bytes=0,
+        )
+
+
+def test_ppo_config_limits_request_concurrency_by_bytes(profile):
+    tokens = 4
+    per_request_bytes = profile.estimate_payload_bytes(tokens)
+    actor_infer = WorkerConfig(
+        strategy_args=StrategyArguments(strategy_name="sglang"),
+        generating_args=GeneratingArguments(num_return_sequences=1),
+        attention_selection_profile=profile,
+    )
+
+    config = PPOConfig(
+        sequence_length=tokens + 1,
+        rollout_batch_size=2,
+        max_running_requests=128,
+        execution_artifact_max_inflight_bytes=per_request_bytes * 2,
+        execution_artifact_max_batch_bytes=profile.estimate_packed_bytes(tokens, batch_size=2),
+        actor_infer=actor_infer,
+    )
+
+    assert config.max_running_requests == 2
+
+
+def test_ppo_config_rejects_batch_over_byte_budget(profile):
+    tokens = 4
+    per_request_bytes = profile.estimate_payload_bytes(tokens)
+    actor_infer = WorkerConfig(
+        strategy_args=StrategyArguments(strategy_name="sglang"),
+        generating_args=GeneratingArguments(num_return_sequences=1),
+        attention_selection_profile=profile,
+    )
+
+    with pytest.raises(ValueError, match="cannot fit one rollout batch"):
+        PPOConfig(
+            sequence_length=tokens + 1,
+            rollout_batch_size=2,
+            execution_artifact_max_inflight_bytes=per_request_bytes * 2,
+            execution_artifact_max_batch_bytes=per_request_bytes,
+            actor_infer=actor_infer,
+        )
+
+
+def test_ppo_config_requires_inflight_byte_budget(profile):
+    tokens = 4
+    actor_infer = WorkerConfig(
+        strategy_args=StrategyArguments(strategy_name="sglang"),
+        generating_args=GeneratingArguments(num_return_sequences=1),
+        attention_selection_profile=profile,
+    )
+
+    with pytest.raises(ValueError, match="execution_artifact_max_inflight_bytes"):
+        PPOConfig(
+            sequence_length=tokens + 1,
+            rollout_batch_size=1,
+            execution_artifact_max_batch_bytes=profile.estimate_packed_bytes(tokens),
+            actor_infer=actor_infer,
+        )
 
 
 def test_profile_rejects_wrong_producer_backend(profile):
     with pytest.raises(ValueError, match="does not match producer vllm"):
         profile.validate_producer("vllm")
+
+
+def test_profile_validates_vllm_raw_sources(profile):
+    profile.validate_vllm_profile(make_vllm_raw_profile(profile))
+
+
+def test_profile_rejects_vllm_codec_version_mismatch(profile):
+    producer_profile = make_vllm_raw_profile(profile)
+    producer_profile["codec_version"] = 2
+
+    with pytest.raises(ValueError, match="unsupported kind or codec version"):
+        profile.validate_vllm_profile(producer_profile)
+
+
+def test_profile_rejects_vllm_compact_source_without_adapter(profile):
+    sources = make_vllm_raw_profile(profile)["sources"]
+    for source in sources:
+        source["shape"] = [profile.topk // 4 + 2]
+        source["codec"] = "qsa_blocks"
+
+    with pytest.raises(ValueError, match="source-aware adapter"):
+        profile.validate_vllm_profile(make_vllm_raw_profile(profile, sources))
+
+
+def test_profile_rejects_duplicate_vllm_source_layers(profile):
+    sources = [
+        {
+            "layer_id": 0,
+            "shape": [profile.topk],
+            "semantic": "logical_token_id",
+            "codec": "int32",
+        }
+        for _ in range(profile.num_layers)
+    ]
+
+    with pytest.raises(ValueError, match="layer_ids must be unique"):
+        profile.validate_vllm_profile(make_vllm_raw_profile(profile, sources))
+
+
+@pytest.mark.parametrize("shape", [[], [0], [-1], [True], ["4"]])
+def test_profile_rejects_invalid_vllm_source_shape(profile, shape):
+    sources = make_vllm_raw_profile(profile)["sources"]
+    sources[0]["shape"] = shape
+
+    with pytest.raises(ValueError, match="does not match raw topk"):
+        profile.validate_vllm_profile(make_vllm_raw_profile(profile, sources))
 
 
 @pytest.mark.parametrize(
@@ -77,6 +219,16 @@ def test_decode_attention_selection_from_base64(profile):
     assert decoded.dtype == torch.int32
     assert decoded.is_contiguous()
     torch.testing.assert_close(decoded.flatten(), torch.from_numpy(values))
+
+
+def test_decode_attention_selection_reuses_writable_int32_numpy_storage(profile):
+    values = np.arange(3 * profile.row_width, dtype=np.int32).reshape(
+        3, profile.num_layers, profile.topk
+    )
+
+    decoded = decode_attention_selection(values, profile, expected_rows=3)
+
+    assert np.shares_memory(decoded.numpy(), values)
 
 
 def test_decode_attention_selection_rejects_shape_mismatch(profile):

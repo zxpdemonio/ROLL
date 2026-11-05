@@ -364,9 +364,15 @@ class VllmStrategy(InferenceStrategy):
 
         if self.attention_selection_profile is not None:
             vllm_config["enable_return_indexer_topk"] = True
+            aux_output_config = dict(vllm_config.get("aux_output_config") or {})
+            aux_output_config["enable_return_indexer_topk"] = True
+            if self.worker_config.attention_selection_max_bytes is not None:
+                aux_output_config["max_bytes"] = self.worker_config.attention_selection_max_bytes
+            vllm_config["aux_output_config"] = aux_output_config
             logger.info(
-                "Sparse attention selection capture enabled with profile %s",
+                "Sparse attention selection capture enabled with profile %s and max_bytes=%s",
                 self.attention_selection_profile.profile_id,
+                self.worker_config.attention_selection_max_bytes,
             )
 
         logger.info(f"vllm_config: {vllm_config}")
@@ -551,9 +557,18 @@ class VllmStrategy(InferenceStrategy):
                 lora_int_id = lora_int_ids[0]
                 lora_request = LoRARequest(lora_name=f"{lora_int_id}", lora_int_id=lora_int_id, lora_path="dummy_lora_path")
 
+        sampling_params = dict(payload["sampling_params"])
+        if self.attention_selection_profile is not None:
+            token_start = sampling_params.get("indexer_topk_prompt_start", 0)
+            if token_start != 0:
+                raise ValueError(
+                    f"ROLL training requires the full attention-selection range, got token start {token_start}"
+                )
+            sampling_params["indexer_topk_prompt_start"] = 0
+
         result_generator = self.model.generate(
             prompt=prompt,
-            sampling_params=SamplingParams(**payload["sampling_params"]),
+            sampling_params=SamplingParams(**sampling_params),
             request_id=payload["rid"],
             lora_request=lora_request,
         )
@@ -590,10 +605,10 @@ class VllmStrategy(InferenceStrategy):
                 )
 
             # Router replay (R3): R3 training consumes the next-token-aligned prompt_len + gen_len - 1 rows.
+            expected_rows = prompt_len + len(completion_output.token_ids) - 1
             re = getattr(completion_output, "routed_experts", None)
             if re is not None:
                 re = torch.as_tensor(re)
-                expected_rows = prompt_len + len(completion_output.token_ids) - 1
                 assert re.size(0) >= expected_rows, (
                     f"routed_experts rows {re.size(0)} < expected {expected_rows} "
                     f"(rid={payload.get('rid')}, prompt_len={prompt_len}, "
@@ -608,12 +623,12 @@ class VllmStrategy(InferenceStrategy):
                     raise RuntimeError(
                         "attention_selection_profile is configured but vLLM returned no indexer_topk"
                     )
-                returned_layers = getattr(completion_output, "indexer_topk_num_layers", None)
-                if returned_layers is not None and returned_layers != self.attention_selection_profile.num_layers:
-                    raise ValueError(
-                        f"vLLM indexer_topk_num_layers {returned_layers} != profile num_layers "
-                        f"{self.attention_selection_profile.num_layers}"
+                producer_profile = getattr(completion_output, "indexer_profile", None)
+                if producer_profile is None:
+                    raise RuntimeError(
+                        "attention_selection_profile is configured but vLLM returned no indexer_profile"
                     )
+                self.attention_selection_profile.validate_vllm_profile(producer_profile)
                 attention_selections.append(
                     decode_attention_selection(
                         raw_selection,

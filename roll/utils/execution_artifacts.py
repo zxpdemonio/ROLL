@@ -1,5 +1,6 @@
 import base64
 import binascii
+import math
 from dataclasses import dataclass
 from typing import Literal
 
@@ -63,11 +64,76 @@ class AttentionSelectionProfile:
             raise ValueError(f"batch_size must be positive, got {batch_size}")
         return batch_size * num_tokens * self.row_width * np.dtype(self.stored_dtype).itemsize
 
+    def estimate_packed_bytes(self, num_tokens: int, batch_size: int = 1) -> int:
+        """Estimate the canonical DataProto tensors, including valid row counts."""
+        selection_bytes = self.estimate_payload_bytes(num_tokens, batch_size)
+        valid_count_bytes = batch_size * np.dtype(np.int32).itemsize
+        return selection_bytes + valid_count_bytes
+
+    def max_concurrent_requests(self, num_tokens: int, max_bytes: int) -> int:
+        if max_bytes <= 0:
+            raise ValueError(f"max_bytes must be positive, got {max_bytes}")
+        per_request = self.estimate_payload_bytes(num_tokens)
+        if per_request == 0:
+            return 0
+        return max_bytes // per_request
+
     def validate_producer(self, backend_family: str) -> None:
         if self.backend_family != backend_family:
             raise ValueError(
                 f"attention selection profile backend {self.backend_family} does not match producer {backend_family}"
             )
+
+    def validate_vllm_profile(self, value: dict) -> None:
+        """Validate the homogeneous raw DeepSeek profile returned by vLLM.
+
+        QSA/Pool/Region codecs deliberately fail here; they need their own
+        source-aware layout adapter instead of being mistaken for token IDs.
+        """
+        if not isinstance(value, dict):
+            raise TypeError(f"vLLM indexer_profile must be a dict, got {type(value)}")
+        if value.get("kind") != "indexer" or value.get("codec_version") != 1:
+            raise ValueError("vLLM indexer_profile has an unsupported kind or codec version")
+        if not isinstance(value.get("model_identity"), str) or not value["model_identity"]:
+            raise ValueError("vLLM indexer_profile requires model_identity")
+        if value.get("storage_dtype") != self.stored_dtype:
+            raise ValueError(
+                f"vLLM indexer_profile dtype {value.get('storage_dtype')} != {self.stored_dtype}"
+            )
+        sources = value.get("sources")
+        if not isinstance(sources, list) or len(sources) != self.num_layers:
+            raise ValueError(
+                f"vLLM indexer_profile sources {0 if not isinstance(sources, list) else len(sources)} "
+                f"!= profile num_layers {self.num_layers}"
+            )
+        source_layer_ids = []
+        for source in sources:
+            if not isinstance(source, dict):
+                raise TypeError(f"vLLM indexer source must be a dict, got {type(source)}")
+            layer_id = source.get("layer_id")
+            if not isinstance(layer_id, int) or isinstance(layer_id, bool) or layer_id < 0:
+                raise ValueError(f"vLLM indexer source has invalid layer_id {layer_id}")
+            source_layer_ids.append(layer_id)
+            if self.coordinate_space != "token" or source.get("semantic") != "logical_token_id":
+                raise ValueError(
+                    "the raw DeepSeek adapter requires logical token coordinates"
+                )
+            if source.get("codec", "int32") != "int32":
+                raise ValueError(
+                    f"vLLM indexer codec {source.get('codec')} requires a source-aware adapter"
+                )
+            shape = source.get("shape")
+            valid_shape = (
+                isinstance(shape, (list, tuple))
+                and bool(shape)
+                and all(isinstance(dim, int) and not isinstance(dim, bool) and dim > 0 for dim in shape)
+            )
+            if not valid_shape or math.prod(shape) != self.topk:
+                raise ValueError(
+                    f"vLLM indexer source shape {shape} does not match raw topk {self.topk}"
+                )
+        if len(set(source_layer_ids)) != len(source_layer_ids):
+            raise ValueError("vLLM indexer source layer_ids must be unique")
 
 
 def decode_attention_selection(
@@ -86,12 +152,24 @@ def decode_attention_selection(
     if isinstance(value, (bytes, bytearray, memoryview)):
         if len(value) % np.dtype(np.int32).itemsize != 0:
             raise ValueError("attention selection byte length is not aligned to int32")
-        value = np.frombuffer(value, dtype=np.int32)
+        # Buffer inputs may be immutable. Copy once so the returned Torch tensor
+        # never aliases read-only memory.
+        value = np.frombuffer(value, dtype=np.int32).copy()
 
     if isinstance(value, np.ndarray):
         if not np.issubdtype(value.dtype, np.integer):
             raise TypeError(f"attention selection must contain integers, got {value.dtype}")
-        selection = torch.tensor(value, dtype=torch.int32)
+        array = value
+        if array.dtype != np.int32:
+            array = array.astype(np.int32, copy=False)
+        if not array.flags.c_contiguous:
+            array = np.ascontiguousarray(array)
+        if not array.flags.writeable:
+            array = array.copy()
+        # vLLM's in-process API already returns a CPU int32 NumPy array. Keep a
+        # view until pack_attention_selection copies it into the final batch;
+        # an eager torch.tensor() copy doubles the transient top-2048 payload.
+        selection = torch.from_numpy(array)
     elif isinstance(value, torch.Tensor):
         if value.dtype.is_floating_point or value.dtype.is_complex or value.dtype == torch.bool:
             raise TypeError(f"attention selection must contain integers, got {value.dtype}")

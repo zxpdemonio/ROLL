@@ -174,6 +174,24 @@ class BaseConfig(ScheduleConfig):
             "or max_running_requests for sglang) when configured in actor_infer strategy_config."
         }
     )
+    execution_artifact_max_batch_bytes: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Maximum sparse execution-artifact bytes in one rollout/training batch. "
+                "Required when sparse-attention selection capture is enabled."
+            )
+        },
+    )
+    execution_artifact_max_inflight_bytes: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Maximum estimated sparse execution-artifact bytes across concurrent rollout requests. "
+                "Required when sparse-attention selection capture is enabled."
+            )
+        },
+    )
     val_batch_size: int = field(
         default=128,
         metadata={"help": "The number of samples to rollout in each val batch."})
@@ -725,6 +743,38 @@ class PPOConfig(BaseConfig):
     def __post_init__(self):
         super().__post_init__()
         assert self.async_generation_ratio == 0 or self.generate_opt_level == 1
+
+        profile = self.actor_infer.attention_selection_profile
+        if profile is not None:
+            inflight_budget = self.execution_artifact_max_inflight_bytes
+            if inflight_budget is None or inflight_budget <= 0:
+                raise ValueError("execution_artifact_max_inflight_bytes must be positive")
+            if self.execution_artifact_max_batch_bytes is None or self.execution_artifact_max_batch_bytes <= 0:
+                raise ValueError("execution_artifact_max_batch_bytes must be positive")
+
+            selection_tokens = self.sequence_length - 1
+            per_request_bytes = profile.estimate_payload_bytes(selection_tokens)
+            max_requests = profile.max_concurrent_requests(selection_tokens, inflight_budget)
+            if max_requests < 1:
+                raise ValueError(
+                    "execution_artifact_max_inflight_bytes cannot fit one maximum-length request: "
+                    f"required={per_request_bytes}, configured={inflight_budget}"
+                )
+            batch_bytes = profile.estimate_packed_bytes(selection_tokens, self.rollout_batch_size)
+            if batch_bytes > self.execution_artifact_max_batch_bytes:
+                raise ValueError(
+                    "execution_artifact_max_batch_bytes cannot fit one rollout batch: "
+                    f"required={batch_bytes}, configured={self.execution_artifact_max_batch_bytes}"
+                )
+            if self.max_running_requests > max_requests:
+                logger.info(
+                    "Limit max_running_requests from %s to %s using sparse-attention byte budget",
+                    self.max_running_requests,
+                    max_requests,
+                )
+                self.max_running_requests = max_requests
+                if self.router_args is not None:
+                    self.router_args.max_running_requests = max_requests
 
         if (
             self.actor_train.model_args.model_name_or_path is None
