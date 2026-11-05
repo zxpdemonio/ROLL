@@ -37,7 +37,7 @@ from roll.utils.functionals import (
     build_domain_routing_context,
     compute_ref_log_probs_with_routing,
     compute_token_reward,
-    hold_aside_routed_experts,
+    hold_aside_actor_replay_artifacts,
     masked_mean,
     reduce_metrics,
     batch_balance,
@@ -385,17 +385,20 @@ class AgenticPipeline(BasePipeline):
                                         "reference/compute_log_probs",
                                     )
                                     metrics.update(dynamic_batching_metrics)
-                                ref_log_probs_refs: List[ray.ObjectRef] = self.actor_train.compute_log_probs(batch, blocking=False)
-                                ref_log_probs = DataProto.materialize_concat(data_refs=ref_log_probs_refs)
+                                with hold_aside_actor_replay_artifacts(batch):
+                                    ref_log_probs_refs: List[ray.ObjectRef] = self.actor_train.compute_log_probs(
+                                        batch, blocking=False
+                                    )
+                                    ref_log_probs = DataProto.materialize_concat(data_refs=ref_log_probs_refs)
                                 ref_log_probs.rename(old_keys="log_probs", new_keys="ref_log_probs")
                                 batch = batch.union(ref_log_probs)
                                 avg_ref_log_prob = masked_mean(batch.batch["ref_log_probs"], batch.batch["response_mask"][:, 1:])
                                 metrics.update(reduce_metrics(ref_log_probs.meta_info.pop("metrics", {})))
                                 metrics.update({"critic/ref_log_prob/mean": avg_ref_log_prob.item()})
                             else:
-                                # Hold aside routed_experts without materializing it: when it lives in
-                                # the TransferQueue remote view, pop the view only (no TQ GET).
-                                with hold_aside_routed_experts(batch):
+                                # Keep actor replay artifacts out of the reference dispatch. Remote
+                                # fields remain TransferQueue/Mooncake handles, so this performs no GET.
+                                with hold_aside_actor_replay_artifacts(batch):
                                     domain_to_teacher_names, domain_values = build_domain_routing_context(
                                         batch, self.pipeline_config, domain_key="tags"
                                     )
@@ -447,6 +450,11 @@ class AgenticPipeline(BasePipeline):
                             metrics.update({"critic/entropy/mean": agg_entropy.item()})
                         else:
                             batch.batch["old_log_probs"] = torch.zeros_like(batch.batch["attention_mask"][:, 1:])
+
+                        # From this point until actor training, replay tensors are only dead weight.
+                        # ExitStack guarantees restoration on failures; the explicit restore below
+                        # attaches them to the final batch only after critic dispatch.
+                        restore_actor_replay = defer.enter_context(hold_aside_actor_replay_artifacts(batch))
 
                         if self.pipeline_config.use_critic:
                             values_refs: List[ray.ObjectRef] = self.critic.compute_values(batch, blocking=False)
@@ -523,6 +531,8 @@ class AgenticPipeline(BasePipeline):
                             tracer.start_as_current_span("train"):
                         if self.pipeline_config.use_critic:
                             critic_train_metrics_refs: List[ray.ObjectRef] = self.critic.train_step(batch, blocking=False)
+
+                        restore_actor_replay(batch)
 
                         # implement critic warmup
                         if self.pipeline_config.critic_warmup <= global_step:

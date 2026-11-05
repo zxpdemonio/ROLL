@@ -30,6 +30,7 @@ from roll.distributed.scheduler.transfer_backend import (
     _mooncake_client_scope,
     _prepare_mooncake_backend_config,
 )
+from roll.utils.functionals import hold_aside_actor_replay_artifacts
 
 
 def _wait_for_port(host: str, port: int, timeout: float = 10.0) -> None:
@@ -580,6 +581,34 @@ def test_column_remote_batch_preserves_row_order_through_transforms():
     del view["tokens"]
     assert "tokens" in remote
     assert torch.equal(remote.materialize(["tokens"])["tokens"], remote.cache["tokens"])
+
+
+def test_actor_replay_artifacts_stay_remote_while_held_aside(monkeypatch):
+    get_calls = []
+
+    def fail_on_get(**kwargs):
+        get_calls.append(kwargs)
+        raise AssertionError("holding aside replay artifacts must not fetch them")
+
+    monkeypatch.setattr(transfer_backend, "get", fail_on_get)
+    fields = {
+        "routed_experts": {"ref": "rollout", "kind": "batch"},
+        "attention_selection": {"ref": "rollout", "kind": "batch"},
+        "attention_selection_valid_count": {"ref": "rollout", "kind": "batch"},
+    }
+    expected_fields = set(fields)
+    batch = DataProto(
+        batch=TensorDict({"tokens": torch.tensor([[10], [20]])}, batch_size=[2]),
+        remote_batch=_column_remote(fields, 2, row_ids=["row-0", "row-1"]),
+    )
+
+    with hold_aside_actor_replay_artifacts(batch, realign_indices=torch.tensor([1, 0])):
+        assert batch._remote_batch is None
+        assert torch.equal(batch.batch["tokens"], torch.tensor([[10], [20]]))
+
+    assert get_calls == []
+    assert set(batch._remote_batch.fields) == expected_fields
+    assert batch._remote_batch.row_ids() == ["row-1", "row-0"]
 
 
 def test_union_only_adopts_cleanup_for_new_fields(monkeypatch):

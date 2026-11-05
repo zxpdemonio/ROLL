@@ -46,7 +46,7 @@ from roll.utils.functionals import (
     compute_ref_log_probs_with_routing,
     compute_token_reward,
     get_sample_level_mask,
-    hold_aside_routed_experts,
+    hold_aside_actor_replay_artifacts,
     reduce_metrics,
     reward_postprocess,
 )
@@ -536,8 +536,8 @@ class RLVRVLMPipeline(BasePipeline):
                 with Timer(name="cal_ref_log_probs", logger=None) as cal_ref_log_probs_timer, \
                         tracer.start_as_current_span("cal_ref_log_probs"):
                     if self.pipeline_config.enable_reference:
-                        # Ref log-prob pass doesn't need routed_experts; hold it aside during dispatch.
-                        with hold_aside_routed_experts(batch):
+                        # Reference log-prob passes do not consume actor replay artifacts.
+                        with hold_aside_actor_replay_artifacts(batch):
                             domain_to_teacher_names, domain_values = build_domain_routing_context(
                                 batch, self.pipeline_config, domain_key="domain"
                             )
@@ -555,8 +555,8 @@ class RLVRVLMPipeline(BasePipeline):
                         tracer.start_as_current_span("cal_old_log_probs_values"):
                     batch.meta_info["is_offload_states"] = False
                     if self.pipeline_config.adv_estimator == "gae":
-                        # Critic doesn't need routed_experts; hold it aside during dispatch.
-                        with hold_aside_routed_experts(batch):
+                        # Critic does not consume actor replay artifacts; hold them aside during dispatch.
+                        with hold_aside_actor_replay_artifacts(batch):
                             values_refs: List[ray.ObjectRef] = self.critic.compute_values(batch, blocking=False)
 
                     if self.pipeline_config.enable_old_logprobs_recompute:
@@ -598,10 +598,10 @@ class RLVRVLMPipeline(BasePipeline):
                 # group by domain to process reward
                 # Restore original generate order before group_by, so that same-prompt responses
                 # remain contiguous for correct GRPO group reward normalization (reshape by n_sample).
-                # routed_experts is only needed by actor old_log_probs / train_step; hold it aside so
+                # Replay artifacts are only needed by actor old_log_probs / train_step; hold them aside so
                 # reorder/group_by/advantage CPU ops don't drag the large tensor around.
                 _reorder_idx = torch.argsort(batch.batch["prompt_id"])
-                with hold_aside_routed_experts(batch, realign_indices=_reorder_idx) as restore:
+                with hold_aside_actor_replay_artifacts(batch, realign_indices=_reorder_idx) as restore:
                     batch.reorder(indices=_reorder_idx)
                     batch_grouped: Dict[str, DataProto] = batch.group_by("domain")
                     batch_list = []
@@ -690,7 +690,7 @@ class RLVRVLMPipeline(BasePipeline):
                         if self.pipeline_config.adv_estimator == "gae":
                             critic_train_metrics_refs: List[ray.ObjectRef] = self.critic.train_step(batch, blocking=False)
 
-                        # Restore routed_experts only for actor training; critic doesn't need it.
+                        # Restore replay artifacts only for actor training; critic does not consume them.
                         restore(batch)
 
                         with actor_train_timer:

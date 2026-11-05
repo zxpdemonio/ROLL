@@ -25,6 +25,7 @@ from roll.platforms import current_platform
 from roll.utils.kl_controller import AdaptiveKLController
 from roll.utils.logging import get_logger
 from roll.utils.execution_artifacts import (
+    ACTOR_REPLAY_ARTIFACT_KEYS,
     ATTENTION_SELECTION_KEY,
     ATTENTION_SELECTION_VALID_COUNT_KEY,
     AttentionSelectionProfile,
@@ -1036,12 +1037,19 @@ def build_domain_to_teacher_names(
     return domain_to_teacher_names
 
 
-def _reattach_routed_experts(batch, holder) -> None:
+def _reattach_remote_batch(batch, holder) -> None:
+    from roll.distributed.scheduler.remote_protocol import RemoteBatch
 
+    if not isinstance(holder, RemoteBatch):
+        raise TypeError(f"expected RemoteBatch, got {type(holder)}")
+    batch._remote_batch = batch._remote_batch.union(holder) if batch._remote_batch is not None else holder
+
+
+def _reattach_routed_experts(batch, holder) -> None:
     from roll.distributed.scheduler.remote_protocol import RemoteBatch
 
     if isinstance(holder, RemoteBatch):
-        batch._remote_batch = batch._remote_batch.union(holder) if batch._remote_batch is not None else holder
+        _reattach_remote_batch(batch, holder)
     else:
         batch.batch["routed_experts"] = holder
 
@@ -1059,48 +1067,71 @@ def attach_routed_experts(batch, source) -> None:
 
 
 @contextmanager
-def hold_aside_routed_experts(batch, realign_key: Optional[str] = None, realign_indices=None):
-    """Temporarily pop routed_experts from batch so cheap CPU ops
-    (reorder/group_by/dispatch) don't drag the huge tensor around; it is
-    re-attached automatically on context exit (also on exception).
+def _hold_aside_tensor_fields(batch, fields, realign_key: Optional[str] = None, realign_indices=None):
+    remote_fields = [field for field in fields if batch._remote_batch is not None and field in batch._remote_batch]
+    remote_holder = batch._remote_batch.pop(remote_fields) if remote_fields else None
+    local_holder = {field: batch.batch.pop(field) for field in fields if field in batch._batch}
 
-    If the batch rows are reordered while detached, pass ``realign_key`` (a batch
-    field holding the original row indices) or ``realign_indices`` so the holder
-    (local tensor or RemoteBatch handle) is re-aligned on restore.
-    Yields a restore() callable for early restore.
-    """
-    if batch._remote_batch is not None and "routed_experts" in batch._remote_batch:
-        holder = batch._remote_batch.pop(["routed_experts"])
-        # Avoid dispatching an empty remote-batch shell: workers crash in
-        # materialize() when cache is None and there are no fields to fetch.
-        if len(batch._remote_batch.fields) == 0:
-            batch._remote_batch = None
-    else:
-        holder = batch.batch.pop("routed_experts", None)
+    # Avoid dispatching an empty remote-batch shell: workers crash in
+    # materialize() when cache is None and there are no fields to fetch.
+    if batch._remote_batch is not None and len(batch._remote_batch.fields) == 0:
+        batch._remote_batch = None
 
     restored = False
 
     def restore(target=None) -> None:
         nonlocal restored
-        if restored or holder is None:
+        if restored:
             return
-        restored = True
+        if remote_holder is None and not local_holder:
+            restored = True
+            return
         target = target if target is not None else batch
         indices = realign_indices if realign_indices is not None else (
             target.batch[realign_key] if realign_key is not None else None
         )
-        payload = holder
-        if indices is not None:
-            # For RemoteBatch this only permutes the handle (row_ids/cache or a
-            # SelectPlan), no data is fetched; required because union() merges
-            # caches positionally after batch.reorder changed the row order.
-            payload = holder[indices]
-        _reattach_routed_experts(target, payload)
+        if remote_holder is not None:
+            # RemoteBatch indexing only adds a selection plan to the handle. It
+            # does not fetch payloads from Mooncake.
+            remote_payload = remote_holder[indices] if indices is not None else remote_holder
+            _reattach_remote_batch(target, remote_payload)
+        for field, value in local_holder.items():
+            target.batch[field] = value[indices] if indices is not None else value
+        restored = True
 
     try:
         yield restore
     finally:
         restore()
+
+
+@contextmanager
+def hold_aside_actor_replay_artifacts(batch, realign_key: Optional[str] = None, realign_indices=None):
+    """Keep large actor-only replay tensors out of unrelated pipeline stages.
+
+    If the batch rows are reordered while detached, pass ``realign_key`` (a batch
+    field holding the original row indices) or ``realign_indices``. Remote
+    artifacts remain Mooncake handles until an actor worker consumes them.
+    """
+    with _hold_aside_tensor_fields(
+        batch,
+        ACTOR_REPLAY_ARTIFACT_KEYS,
+        realign_key=realign_key,
+        realign_indices=realign_indices,
+    ) as restore:
+        yield restore
+
+
+@contextmanager
+def hold_aside_routed_experts(batch, realign_key: Optional[str] = None, realign_indices=None):
+    """Backward-compatible routed-expert-only hold-aside helper."""
+    with _hold_aside_tensor_fields(
+        batch,
+        ("routed_experts",),
+        realign_key=realign_key,
+        realign_indices=realign_indices,
+    ) as restore:
+        yield restore
 
 
 def build_domain_routing_context(

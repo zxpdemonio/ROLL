@@ -42,7 +42,7 @@ from roll.utils.functionals import (
     compute_ref_log_probs_with_routing,
     compute_token_reward,
     get_sample_level_mask,
-    hold_aside_routed_experts,
+    hold_aside_actor_replay_artifacts,
     opsd_teacher_context,
     reduce_metrics,
     reward_postprocess,
@@ -629,9 +629,9 @@ class RLVRPipeline(BasePipeline):
                         teacher_enable_thinking = getattr(getattr(ref_cfg, "data_args", None), "enable_thinking", None)
                         if not self.use_ref_model:
                             # LoRA branch: use actor_train with disabled adapter.
-                            # Ref log-prob pass doesn't need routed_experts; hold it aside
+                            # Reference log-prob passes do not consume actor replay artifacts; hold them aside
                             # and re-align it with prompt_id after the in-place reordering.
-                            with hold_aside_routed_experts(batch, realign_key="prompt_id"):
+                            with hold_aside_actor_replay_artifacts(batch, realign_key="prompt_id"):
                                 worker_config = self.pipeline_config.actor_train
                                 batch_balance(batch, dp_size=self.actor_train.dp_size, minibatch_size=len(batch))
                                 batch.meta_info["disable_adapter"] = True
@@ -657,7 +657,7 @@ class RLVRPipeline(BasePipeline):
                                     batch.batch["ref_log_probs"] = batch.batch[f"ref_log_probs_{ref_name}"]
                                     metrics_mgr.add_reduced_metrics(ref_log_probs.meta_info.pop("metrics", {}))
                         else:
-                            with hold_aside_routed_experts(batch):
+                            with hold_aside_actor_replay_artifacts(batch):
                                 domain_to_teacher_names, domain_values = build_domain_routing_context(
                                     batch, self.pipeline_config, domain_key="domain"
                                 )
@@ -678,8 +678,8 @@ class RLVRPipeline(BasePipeline):
                         batch.meta_info["disable_adapter"] = False
                     batch.meta_info["is_offload_states"] = False
                     if self.pipeline_config.adv_estimator == "gae":
-                        # Critic doesn't need routed_experts; hold it aside during dispatch.
-                        with hold_aside_routed_experts(batch):
+                        # Critic does not consume actor replay artifacts; hold them aside during dispatch.
+                        with hold_aside_actor_replay_artifacts(batch):
                             values_refs: List[ray.ObjectRef] = self.critic.compute_values(batch, blocking=False)
 
                     if self.pipeline_config.enable_old_logprobs_recompute:
@@ -740,10 +740,10 @@ class RLVRPipeline(BasePipeline):
                 metrics_mgr.add_metric("time/old_log_probs", cal_old_logpb_timer.last)
 
                 # 要按domain group by处理reward
-                # routed_experts is only needed by actor old_log_probs / train_step; hold it aside so
+                # Replay artifacts are only needed by actor old_log_probs / train_step; hold them aside so
                 # reorder/group_by/advantage CPU ops don't drag the large tensor around.
                 _reorder_idx = torch.argsort(batch.batch["prompt_id"])
-                with hold_aside_routed_experts(batch, realign_indices=_reorder_idx) as restore:
+                with hold_aside_actor_replay_artifacts(batch, realign_indices=_reorder_idx) as restore:
                     batch.reorder(indices=_reorder_idx)
                     batch_grouped: Dict[str, DataProto] = batch.group_by("domain")
                     batch_list = []
@@ -837,7 +837,7 @@ class RLVRPipeline(BasePipeline):
                         if self.pipeline_config.adv_estimator == "gae":
                             critic_train_metrics_refs: List[ray.ObjectRef] = self.critic.train_step(batch, blocking=False)
 
-                        # Restore routed_experts only for actor training; critic doesn't need it.
+                        # Restore replay artifacts only for actor training; critic does not consume them.
                         restore(batch)
 
                         with actor_train_timer:

@@ -1,6 +1,6 @@
 import base64
 import binascii
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Literal
 
 import numpy as np
@@ -11,6 +11,11 @@ ATTENTION_SELECTION_KEY = "attention_selection"
 ATTENTION_SELECTION_VALID_COUNT_KEY = "attention_selection_valid_count"
 EXECUTION_ARTIFACT_PROFILE_ID_KEY = "execution_artifact_profile_id"
 ATTENTION_SELECTION_PROFILE_KEY = "_attention_selection_profile"
+ACTOR_REPLAY_ARTIFACT_KEYS = (
+    "routed_experts",
+    ATTENTION_SELECTION_KEY,
+    ATTENTION_SELECTION_VALID_COUNT_KEY,
+)
 
 
 @dataclass(frozen=True)

@@ -11,7 +11,7 @@ from roll.utils.execution_artifacts import (
     decode_attention_selection,
     pack_attention_selection,
 )
-from roll.utils.functionals import postprocess_generate
+from roll.utils.functionals import hold_aside_actor_replay_artifacts, postprocess_generate
 
 
 @pytest.fixture
@@ -140,3 +140,61 @@ def test_postprocess_generate_attaches_selection_to_dataproto(profile):
         result.batch["attention_selection_valid_count"], torch.tensor([3, 3], dtype=torch.int32)
     )
     assert torch.all(result.batch["attention_selection"][:, 3] == profile.padding_value)
+
+
+def test_hold_aside_actor_replay_artifacts_realigns_local_tensors():
+    batch = DataProto(
+        batch=TensorDict(
+            {
+                "tokens": torch.tensor([[10], [20]]),
+                "routed_experts": torch.tensor([[1], [2]]),
+                "attention_selection": torch.tensor([[[[11]]], [[[22]]]], dtype=torch.int32),
+                "attention_selection_valid_count": torch.tensor([1, 1], dtype=torch.int32),
+            },
+            batch_size=[2],
+        )
+    )
+
+    with hold_aside_actor_replay_artifacts(batch, realign_indices=torch.tensor([1, 0])):
+        assert "routed_experts" not in batch.batch
+        assert "attention_selection" not in batch.batch
+        assert "attention_selection_valid_count" not in batch.batch
+
+    torch.testing.assert_close(batch.batch["routed_experts"], torch.tensor([[2], [1]]))
+    torch.testing.assert_close(
+        batch.batch["attention_selection"],
+        torch.tensor([[[[22]]], [[[11]]]], dtype=torch.int32),
+    )
+    torch.testing.assert_close(
+        batch.batch["attention_selection_valid_count"],
+        torch.tensor([1, 1], dtype=torch.int32),
+    )
+
+
+def test_hold_aside_actor_replay_artifacts_restores_after_exception():
+    batch = DataProto(
+        batch=TensorDict(
+            {"attention_selection": torch.tensor([[[[11]]]], dtype=torch.int32)},
+            batch_size=[1],
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="reference failed"):
+        with hold_aside_actor_replay_artifacts(batch):
+            raise RuntimeError("reference failed")
+
+    torch.testing.assert_close(
+        batch.batch["attention_selection"],
+        torch.tensor([[[[11]]]], dtype=torch.int32),
+    )
+
+
+def test_hold_aside_actor_replay_artifacts_ignores_realign_key_when_empty():
+    batch = DataProto(
+        batch=TensorDict({"tokens": torch.tensor([[10]])}, batch_size=[1]),
+    )
+
+    with hold_aside_actor_replay_artifacts(batch, realign_key="missing"):
+        pass
+
+    torch.testing.assert_close(batch.batch["tokens"], torch.tensor([[10]]))
