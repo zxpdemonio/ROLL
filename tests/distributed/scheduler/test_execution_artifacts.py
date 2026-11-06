@@ -13,6 +13,7 @@ from roll.utils.execution_artifacts import (
     AttentionSelectionProfile,
     decode_attention_selection,
     pack_attention_selection,
+    unpack_attention_selection,
 )
 from roll.utils.functionals import hold_aside_actor_replay_artifacts, postprocess_generate
 
@@ -61,6 +62,23 @@ def test_profile_estimates_top2048_payload_bytes():
     assert top2048.estimate_payload_bytes(num_tokens=128, batch_size=2) == 12_582_912
     assert top2048.estimate_packed_bytes(num_tokens=128, batch_size=2) == 12_582_920
     assert top2048.max_concurrent_requests(num_tokens=128, max_bytes=25_165_824) == 4
+
+
+def test_profile_estimates_aligned_row_stride():
+    aligned = AttentionSelectionProfile(
+        profile_id="qwen3.8-aligned-v1",
+        model_family="qwen3_8",
+        backend_family="vllm",
+        num_layers=3,
+        topk=3,
+        row_alignment_bytes=64,
+    )
+
+    assert aligned.row_width == 9
+    assert aligned.row_stride_bytes == 64
+    assert aligned.storage_row_width == 16
+    assert aligned.estimate_payload_bytes(num_tokens=4, batch_size=2) == 512
+    assert aligned.estimate_packed_bytes(num_tokens=4, batch_size=2) == 520
 
 
 def test_profile_rejects_non_positive_capacity(profile):
@@ -226,6 +244,19 @@ def test_profile_rejects_invalid_contract(field, value, message):
         AttentionSelectionProfile(**kwargs)
 
 
+@pytest.mark.parametrize("alignment", [True, 0, 2, 3, 12])
+def test_profile_rejects_invalid_row_alignment(alignment):
+    with pytest.raises(ValueError, match="row_alignment_bytes"):
+        AttentionSelectionProfile(
+            profile_id="profile",
+            model_family="model",
+            backend_family="backend",
+            num_layers=2,
+            topk=4,
+            row_alignment_bytes=alignment,
+        )
+
+
 def test_decode_attention_selection_from_base64(profile):
     values = np.arange(3 * profile.row_width, dtype=np.int32)
     encoded = base64.b64encode(values.tobytes()).decode("ascii")
@@ -274,6 +305,52 @@ def test_pack_attention_selection_adds_padding_and_valid_counts(profile):
     assert torch.all(packed[0, 3] == profile.padding_value)
     assert torch.all(packed[1, 1:] == profile.padding_value)
     torch.testing.assert_close(valid_counts, torch.tensor([3, 1], dtype=torch.int32))
+
+
+def test_pack_attention_selection_aligns_each_stored_row():
+    profile = AttentionSelectionProfile(
+        profile_id="qwen3.8-aligned-v1",
+        model_family="qwen3_8",
+        backend_family="vllm",
+        num_layers=3,
+        topk=3,
+        row_alignment_bytes=64,
+    )
+    selection = torch.arange(2 * profile.row_width, dtype=torch.int32).reshape(
+        2, profile.num_layers, profile.topk
+    )
+
+    packed, valid_counts = pack_attention_selection(
+        [selection],
+        valid_counts=[2],
+        sequence_length=4,
+        profile=profile,
+    )
+
+    assert packed.shape == (1, 3, profile.storage_row_width)
+    assert packed.stride(1) * packed.element_size() == profile.row_stride_bytes
+    assert torch.all(packed[..., profile.row_width :] == profile.padding_value)
+    semantic = unpack_attention_selection(packed, profile)
+    assert semantic.shape == (1, 3, profile.num_layers, profile.topk)
+    torch.testing.assert_close(semantic[0, :2], selection)
+    assert torch.all(semantic[0, 2] == profile.padding_value)
+    torch.testing.assert_close(valid_counts, torch.tensor([2], dtype=torch.int32))
+
+
+def test_unpack_attention_selection_rejects_noncontiguous_storage():
+    profile = AttentionSelectionProfile(
+        profile_id="qwen3.8-aligned-v1",
+        model_family="qwen3_8",
+        backend_family="vllm",
+        num_layers=3,
+        topk=3,
+        row_alignment_bytes=64,
+    )
+    packed = torch.full((1, 2, profile.storage_row_width * 2), profile.padding_value, dtype=torch.int32)
+    noncontiguous = packed[..., ::2]
+
+    with pytest.raises(ValueError, match="must be contiguous"):
+        unpack_attention_selection(noncontiguous, profile)
 
 
 def test_postprocess_generate_attaches_selection_to_dataproto(profile):

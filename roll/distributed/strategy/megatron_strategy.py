@@ -100,6 +100,7 @@ from roll.utils.execution_artifacts import (
     ATTENTION_SELECTION_KEY,
     ATTENTION_SELECTION_VALID_COUNT_KEY,
     EXECUTION_ARTIFACT_PROFILE_ID_KEY,
+    unpack_attention_selection,
 )
 from roll.utils.functionals import (
     adjust_sequence_length,
@@ -318,8 +319,12 @@ class MegatronInferStrategy(InferenceStrategy):
                 "sparse-attention replay profile mismatch: "
                 f"batch={actual_profile_id}, configured={self.attention_selection_profile.profile_id}"
             )
-        validate_sparse_attention_replay(
+        selection = unpack_attention_selection(
             batch.batch[ATTENTION_SELECTION_KEY],
+            self.attention_selection_profile,
+        )
+        validate_sparse_attention_replay(
+            selection,
             batch.batch[ATTENTION_SELECTION_VALID_COUNT_KEY],
             query_length=batch.batch["input_ids"].shape[1],
             num_layers=self.attention_selection_profile.num_layers,
@@ -801,7 +806,10 @@ class MegatronInferStrategy(InferenceStrategy):
             )
             set_sparse_attention_replay_data(
                 unwrapped_model,
-                data.batch[ATTENTION_SELECTION_KEY],
+                unpack_attention_selection(
+                    data.batch[ATTENTION_SELECTION_KEY],
+                    self.attention_selection_profile,
+                ),
                 data.batch[ATTENTION_SELECTION_VALID_COUNT_KEY],
                 query_length=input_ids.shape[1],
             )

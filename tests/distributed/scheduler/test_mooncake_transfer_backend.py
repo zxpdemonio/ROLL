@@ -103,6 +103,12 @@ def _column_remote(fields, batch_size, *, cache=None, row_ids=None, partition="r
     )
 
 
+def _aligned_attention_selection() -> torch.Tensor:
+    rows = torch.full((2, 3, 16), -1, dtype=torch.int32)
+    rows[..., :8] = torch.arange(2 * 3 * 8, dtype=torch.int32).reshape(2, 3, 8)
+    return rows
+
+
 def test_mooncake_client_scope_defaults_to_node():
     config = TransferBackendArguments(backend_name="Mooncake", backend_config={})
 
@@ -225,7 +231,7 @@ def test_mooncake_client_uses_unified_dataproto_api(monkeypatch):
             return {
                 "batch": {
                     "tokens": torch.tensor([[1], [2]]),
-                    "attention_selection": torch.arange(2 * 3 * 2 * 4, dtype=torch.int32).reshape(2, 3, 2, 4),
+                    "attention_selection": _aligned_attention_selection(),
                 },
                 "non_tensor_batch": {"prompt": np.array(["a", "b"], dtype=object)},
             }
@@ -267,7 +273,7 @@ def test_mooncake_client_uses_unified_dataproto_api(monkeypatch):
     )
 
     prompt = np.array(["a", "b"], dtype=object)
-    attention_selection = torch.arange(2 * 3 * 2 * 4, dtype=torch.int32).reshape(2, 3, 2, 4)
+    attention_selection = _aligned_attention_selection()
     remote = client.put(
         "rollout",
         ["0", "1"],
@@ -308,6 +314,7 @@ def test_mooncake_client_uses_unified_dataproto_api(monkeypatch):
     assert torch.equal(materialized["tokens"], torch.tensor([[1], [2]]))
     assert torch.equal(materialized["attention_selection"], attention_selection)
     assert materialized["attention_selection"].is_contiguous()
+    assert materialized["attention_selection"].stride(1) * materialized["attention_selection"].element_size() == 64
     assert list(materialized["prompt"]) == ["a", "b"]
 
     client.release(materialized)

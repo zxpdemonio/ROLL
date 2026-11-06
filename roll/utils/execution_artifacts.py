@@ -21,7 +21,11 @@ ACTOR_REPLAY_ARTIFACT_KEYS = (
 
 @dataclass(frozen=True)
 class AttentionSelectionProfile:
-    """Job-level description of one sparse-attention selection layout."""
+    """Job-level description of one sparse-attention selection layout.
+
+    ``row_alignment_bytes`` pads the stored row stride. Mooncake owns the
+    independent base-address alignment of its registered buffers.
+    """
 
     profile_id: str
     model_family: str
@@ -33,6 +37,7 @@ class AttentionSelectionProfile:
     stored_dtype: Literal["int32"] = "int32"
     padding_value: int = -1
     preserves_selection_order: bool = True
+    row_alignment_bytes: int | None = None
 
     def __post_init__(self):
         if self.protocol_version != 1:
@@ -50,6 +55,17 @@ class AttentionSelectionProfile:
             raise ValueError(f"unsupported coordinate_space: {self.coordinate_space}")
         if not isinstance(self.preserves_selection_order, bool):
             raise ValueError("preserves_selection_order must be a bool")
+        if self.row_alignment_bytes is not None:
+            alignment = self.row_alignment_bytes
+            if (
+                isinstance(alignment, bool)
+                or not isinstance(alignment, int)
+                or alignment < np.dtype(self.stored_dtype).itemsize
+                or alignment & (alignment - 1)
+            ):
+                raise ValueError(
+                    "row_alignment_bytes must be a power of two no smaller than the stored dtype"
+                )
         if not np.iinfo(np.int32).min <= self.padding_value <= np.iinfo(np.int32).max:
             raise ValueError(f"padding_value does not fit int32: {self.padding_value}")
 
@@ -57,12 +73,23 @@ class AttentionSelectionProfile:
     def row_width(self) -> int:
         return self.num_layers * self.topk
 
+    @property
+    def row_stride_bytes(self) -> int:
+        row_bytes = self.row_width * np.dtype(self.stored_dtype).itemsize
+        if self.row_alignment_bytes is None:
+            return row_bytes
+        return (row_bytes + self.row_alignment_bytes - 1) // self.row_alignment_bytes * self.row_alignment_bytes
+
+    @property
+    def storage_row_width(self) -> int:
+        return self.row_stride_bytes // np.dtype(self.stored_dtype).itemsize
+
     def estimate_payload_bytes(self, num_tokens: int, batch_size: int = 1) -> int:
         if num_tokens < 0:
             raise ValueError(f"num_tokens must be non-negative, got {num_tokens}")
         if batch_size <= 0:
             raise ValueError(f"batch_size must be positive, got {batch_size}")
-        return batch_size * num_tokens * self.row_width * np.dtype(self.stored_dtype).itemsize
+        return batch_size * num_tokens * self.row_stride_bytes
 
     def estimate_packed_bytes(self, num_tokens: int, batch_size: int = 1) -> int:
         """Estimate the canonical DataProto tensors, including valid row counts."""
@@ -217,11 +244,22 @@ def pack_attention_selection(
         raise ValueError(f"sequence_length must be positive, got {sequence_length}")
 
     max_rows = sequence_length - 1
-    packed = torch.full(
-        (len(selections), max_rows, profile.num_layers, profile.topk),
-        fill_value=profile.padding_value,
-        dtype=torch.int32,
-    )
+    if profile.storage_row_width == profile.row_width:
+        packed = torch.full(
+            (len(selections), max_rows, profile.num_layers, profile.topk),
+            fill_value=profile.padding_value,
+            dtype=torch.int32,
+        )
+        semantic_rows = packed
+    else:
+        packed = torch.full(
+            (len(selections), max_rows, profile.storage_row_width),
+            fill_value=profile.padding_value,
+            dtype=torch.int32,
+        )
+        semantic_rows = packed[..., : profile.row_width].view(
+            len(selections), max_rows, profile.num_layers, profile.topk
+        )
     for index, (selection, valid_count) in enumerate(zip(selections, valid_counts)):
         if valid_count < 0:
             raise ValueError(f"attention selection valid_count must be non-negative, got {valid_count}")
@@ -235,6 +273,38 @@ def pack_attention_selection(
             and tuple(selection.shape) == expected_shape
         ):
             selection = decode_attention_selection(selection, profile, expected_rows=valid_count)
-        packed[index, :valid_count].copy_(selection)
+        semantic_rows[index, :valid_count].copy_(selection)
 
     return packed.contiguous(), torch.tensor(valid_counts, dtype=torch.int32)
+
+
+def unpack_attention_selection(
+    value: torch.Tensor,
+    profile: AttentionSelectionProfile,
+) -> torch.Tensor:
+    """Return the semantic ``[B, T, L, K]`` view of a stored selection tensor."""
+
+    if not isinstance(value, torch.Tensor):
+        raise TypeError(f"attention selection must be a torch.Tensor, got {type(value)}")
+    if value.dtype != torch.int32:
+        raise TypeError(f"attention selection must use int32 storage, got {value.dtype}")
+    if not value.is_contiguous():
+        raise ValueError("attention selection storage must be contiguous")
+
+    if profile.storage_row_width == profile.row_width:
+        expected_tail = (profile.num_layers, profile.topk)
+        if value.ndim != 4 or tuple(value.shape[-2:]) != expected_tail:
+            raise ValueError(
+                "attention selection must have shape [B, T, L, K] with "
+                f"L/K={expected_tail}, got {tuple(value.shape)}"
+            )
+        return value
+
+    if value.ndim != 3 or value.shape[-1] != profile.storage_row_width:
+        raise ValueError(
+            "aligned attention selection must have shape [B, T, row_stride_elements] with "
+            f"row_stride_elements={profile.storage_row_width}, got {tuple(value.shape)}"
+        )
+    return value[..., : profile.row_width].view(
+        value.shape[0], value.shape[1], profile.num_layers, profile.topk
+    )
