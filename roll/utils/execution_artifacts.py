@@ -134,6 +134,20 @@ class AttentionSelectionProfile:
                 )
         if len(set(source_layer_ids)) != len(source_layer_ids):
             raise ValueError("vLLM indexer source layer_ids must be unique")
+        expected_layer_ids = list(range(self.num_layers))
+        if source_layer_ids != expected_layer_ids:
+            raise ValueError(
+                "the raw DeepSeek adapter requires one source per model layer in layer order; "
+                f"got {source_layer_ids}"
+            )
+        for source in sources:
+            layer_id = source["layer_id"]
+            consumers = source.get("consumer_layer_ids", [layer_id])
+            if not isinstance(consumers, (list, tuple)) or list(consumers) != [layer_id]:
+                raise ValueError(
+                    "shared sparse-attention sources require a source-aware training adapter; "
+                    f"layer {layer_id} has consumers {consumers}"
+                )
 
 
 def decode_attention_selection(

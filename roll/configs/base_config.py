@@ -746,6 +746,14 @@ class PPOConfig(BaseConfig):
 
         profile = self.actor_infer.attention_selection_profile
         if profile is not None:
+            train_profile = self.actor_train.attention_selection_profile
+            if train_profile is None:
+                self.actor_train.attention_selection_profile = profile
+            elif train_profile != profile:
+                raise ValueError(
+                    "actor_infer and actor_train must use the same attention_selection_profile"
+                )
+
             inflight_budget = self.execution_artifact_max_inflight_bytes
             if inflight_budget is None or inflight_budget <= 0:
                 raise ValueError("execution_artifact_max_inflight_bytes must be positive")

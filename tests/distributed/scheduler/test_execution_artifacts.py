@@ -96,6 +96,7 @@ def test_ppo_config_limits_request_concurrency_by_bytes(profile):
     )
 
     assert config.max_running_requests == 2
+    assert config.actor_train.attention_selection_profile == profile
 
 
 def test_ppo_config_rejects_batch_over_byte_budget(profile):
@@ -173,6 +174,22 @@ def test_profile_rejects_duplicate_vllm_source_layers(profile):
     ]
 
     with pytest.raises(ValueError, match="layer_ids must be unique"):
+        profile.validate_vllm_profile(make_vllm_raw_profile(profile, sources))
+
+
+def test_profile_rejects_out_of_order_vllm_source_layers(profile):
+    sources = make_vllm_raw_profile(profile)["sources"]
+    sources.reverse()
+
+    with pytest.raises(ValueError, match="one source per model layer in layer order"):
+        profile.validate_vllm_profile(make_vllm_raw_profile(profile, sources))
+
+
+def test_profile_rejects_shared_vllm_source_without_training_adapter(profile):
+    sources = make_vllm_raw_profile(profile)["sources"]
+    sources[0]["consumer_layer_ids"] = [0, 1]
+
+    with pytest.raises(ValueError, match="source-aware training adapter"):
         profile.validate_vllm_profile(make_vllm_raw_profile(profile, sources))
 
 

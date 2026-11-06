@@ -71,10 +71,19 @@ from roll.third_party.megatron.offload_states_patch import (
 )
 from roll.third_party.megatron.optimizer import get_megatron_optimizer
 from roll.third_party.megatron.router_replay_utils import (
+    RouterReplayHelper,
     collect_r2_router_indices,
     finalize_r2_routed_experts,
     set_router_replay_data,
-    RouterReplayHelper
+)
+from roll.third_party.megatron.sparse_attention_replay import (
+    SparseAttentionReplayAction,
+    clear_sparse_attention_replay,
+    initialize_sparse_attention_replay,
+    patch_megatron_dsa_replay,
+    set_sparse_attention_replay_action,
+    set_sparse_attention_replay_data,
+    validate_sparse_attention_replay,
 )
 from roll.third_party.megatron.tensor_parallel import vocab_parallel_entropy
 from roll.third_party.megatron.util import unwrap_model
@@ -87,6 +96,11 @@ from roll.utils.constants import (
 )
 from roll.utils.context_managers import disable_gradients
 from roll.utils.dynamic_batching import make_micro_batch_iter_for_dynamic_batching
+from roll.utils.execution_artifacts import (
+    ATTENTION_SELECTION_KEY,
+    ATTENTION_SELECTION_VALID_COUNT_KEY,
+    EXECUTION_ARTIFACT_PROFILE_ID_KEY,
+)
 from roll.utils.functionals import (
     adjust_sequence_length,
     append_to_dict,
@@ -147,6 +161,8 @@ class MegatronInferStrategy(InferenceStrategy):
         self.forward_backward_func = None
         self.seq_length = None
         self.use_sequence_packing = self.worker_config.use_sequence_packing
+        self.attention_selection_profile = None
+        self.enable_sparse_attention_replay = False
         # hard to impl with offload states
         assert not self.megatron_train_args.overlap_param_gather, "overlap_param_gather is not supported"
 
@@ -284,12 +300,45 @@ class MegatronInferStrategy(InferenceStrategy):
         logger.info(f"[RouterReplay] rebuilt global instances: {len(instances)} -> {len(active)}")
         instances[:] = active
 
+    def _validate_sparse_attention_replay_batch(self, batch: DataProto) -> None:
+        if not self.enable_sparse_attention_replay:
+            return
+
+        missing = {
+            ATTENTION_SELECTION_KEY,
+            ATTENTION_SELECTION_VALID_COUNT_KEY,
+        } - set(batch.batch.keys())
+        if missing:
+            raise RuntimeError(
+                f"sparse-attention replay batch is missing required fields: {sorted(missing)}"
+            )
+        actual_profile_id = batch.meta_info.get(EXECUTION_ARTIFACT_PROFILE_ID_KEY)
+        if actual_profile_id != self.attention_selection_profile.profile_id:
+            raise ValueError(
+                "sparse-attention replay profile mismatch: "
+                f"batch={actual_profile_id}, configured={self.attention_selection_profile.profile_id}"
+            )
+        validate_sparse_attention_replay(
+            batch.batch[ATTENTION_SELECTION_KEY],
+            batch.batch[ATTENTION_SELECTION_VALID_COUNT_KEY],
+            query_length=batch.batch["input_ids"].shape[1],
+            num_layers=self.attention_selection_profile.num_layers,
+            topk=self.attention_selection_profile.topk,
+        )
+
+    def _clear_sparse_attention_replay(self) -> None:
+        if not self.enable_sparse_attention_replay:
+            return
+        for model_chunk in self.models_unwrapped:
+            clear_sparse_attention_replay(model_chunk)
+
     def forward_step(
         self,
         batch: DataProto,
         forward_func: Callable[[DataProto, torch.Tensor], Tuple[torch.Tensor, Dict[str, torch.Tensor]]],
     ) -> Dict[str, torch.Tensor]:
         self.model.eval()
+        self._validate_sparse_attention_replay_batch(batch)
 
         if self.enable_router_replay:
             if self.router_replay_mode == "R3":
@@ -347,17 +396,20 @@ class MegatronInferStrategy(InferenceStrategy):
             micro_batch.meta_info['micro_batch_size'] = micro_batch.batch.batch_size[0]
 
         data_iterator = [iter(micro_batches_list) for _ in range(len(self.model))]
-        with disable_gradients(models=self.model.get_models()), adapter_context:
-            # List 是每个 micro-batch 构成的
-            losses_reduced: List[Dict[str, torch.Tensor]] = self.forward_backward_func(
-                forward_step_func=partial(self.inner_forward_step, forward_func),
-                data_iterator=data_iterator,
-                model=self.model.get_models(),
-                num_microbatches=num_microbatches,
-                seq_length=self.seq_length,
-                micro_batch_size=micro_batch_size,
-                forward_only=True,
-            )
+        try:
+            with disable_gradients(models=self.model.get_models()), adapter_context:
+                # List 是每个 micro-batch 构成的
+                losses_reduced: List[Dict[str, torch.Tensor]] = self.forward_backward_func(
+                    forward_step_func=partial(self.inner_forward_step, forward_func),
+                    data_iterator=data_iterator,
+                    model=self.model.get_models(),
+                    num_microbatches=num_microbatches,
+                    seq_length=self.seq_length,
+                    micro_batch_size=micro_batch_size,
+                    forward_only=True,
+                )
+        finally:
+            self._clear_sparse_attention_replay()
         if self.worker_config.use_dynamic_batching_in_infer:
             for data in losses_reduced:
                 for k, v in data.items():
@@ -743,6 +795,17 @@ class MegatronInferStrategy(InferenceStrategy):
         else:
             vp_rank = 0
 
+        if self.enable_sparse_attention_replay:
+            set_sparse_attention_replay_action(
+                unwrapped_model, SparseAttentionReplayAction.REPLAY_FORWARD
+            )
+            set_sparse_attention_replay_data(
+                unwrapped_model,
+                data.batch[ATTENTION_SELECTION_KEY],
+                data.batch[ATTENTION_SELECTION_VALID_COUNT_KEY],
+                query_length=input_ids.shape[1],
+            )
+
         if self.enable_router_replay:
             # Restore REPLAY_FORWARD after previous microbatch's backward recompute left it as REPLAY_BACKWARD
             if RouterReplayHelper.is_replay_backward_action(self.model.config, vp_rank):
@@ -794,6 +857,11 @@ class MegatronInferStrategy(InferenceStrategy):
             input_ids=input_ids, attention_mask=attention_mask, position_ids=position_ids, labels=labels,
             packed_seq_params=packed_seq_params, **forward_args
         )
+
+        if self.enable_sparse_attention_replay:
+            set_sparse_attention_replay_action(
+                unwrapped_model, SparseAttentionReplayAction.REPLAY_BACKWARD
+            )
 
         if RouterReplayHelper.is_r2_record_action(self.model.config, vp_rank):
             # input_ids is already CP-sharded (or packed); the non-packing collect
@@ -1349,6 +1417,30 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
         if self.enable_router_replay:
             logger.info(f"Router Replay {self.router_replay_mode} mode: REPLAY enabled in MegatronTrainStrategy")
 
+        self.attention_selection_profile = self.worker_config.attention_selection_profile
+        self.enable_sparse_attention_replay = self.attention_selection_profile is not None
+        if self.enable_sparse_attention_replay:
+            if self.attention_selection_profile.coordinate_space != "token":
+                raise ValueError(
+                    "Megatron sparse-attention replay currently requires token coordinates"
+                )
+            if self.use_sequence_packing:
+                raise NotImplementedError(
+                    "Megatron sparse-attention replay does not support sequence packing yet"
+                )
+            if (
+                self.worker_config.use_dynamic_batching_in_train
+                or self.worker_config.use_dynamic_batching_in_infer
+            ):
+                raise NotImplementedError(
+                    "Megatron sparse-attention replay does not support dynamic batching yet"
+                )
+            patch_megatron_dsa_replay()
+            logger.info(
+                "Sparse Attention Replay enabled with profile %s",
+                self.attention_selection_profile.profile_id,
+            )
+
     def initialize(self, model_provider):
         self.seq_length = self.worker.pipeline_config.sequence_length
         self.weight_updaters: dict[str, MegatronWeightUpdater] = {}
@@ -1416,6 +1508,26 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
         self.is_multimodal = self.processor is not None
         self._validate_vlm_packing_support()
         self._rebuild_router_replay_instances()
+        if self.enable_sparse_attention_replay:
+            if self.model.config.num_layers != self.attention_selection_profile.num_layers:
+                raise ValueError(
+                    "attention selection layer count does not match Megatron: "
+                    f"profile={self.attention_selection_profile.num_layers}, "
+                    f"model={self.model.config.num_layers}"
+                )
+            model_topk = getattr(self.model.config, "dsa_indexer_topk", None)
+            if model_topk != self.attention_selection_profile.topk:
+                raise ValueError(
+                    "attention selection top-k does not match Megatron: "
+                    f"profile={self.attention_selection_profile.topk}, model={model_topk}"
+                )
+            local_layer_ids = []
+            for model_chunk in self.models_unwrapped:
+                local_layer_ids.extend(initialize_sparse_attention_replay(model_chunk))
+            if not local_layer_ids:
+                raise RuntimeError(
+                    "attention selection profile is configured but the Megatron model has no DSA layers"
+                )
 
         params_dtype = (
             torch.float16
@@ -1451,6 +1563,10 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
         self.worker.rank_info.pp_size = mpu.get_pipeline_model_parallel_world_size()
         self.worker.rank_info.cp_size = mpu.get_context_parallel_world_size()
         self.worker.rank_info.cp_rank = mpu.get_context_parallel_rank()
+        if self.enable_sparse_attention_replay and self.worker.rank_info.cp_size != 1:
+            raise NotImplementedError(
+                "Megatron sparse-attention replay does not support context parallelism yet"
+            )
 
         logger.info(f"max steps pipeline {self.worker_config.training_args.max_steps}")
         self.worker_config.training_args.max_steps = (
@@ -1503,6 +1619,7 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
             assert "routed_experts" in batch.batch
             RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
 
+        self._validate_sparse_attention_replay_batch(batch)
         global_step = batch.meta_info.get("global_step", 0)
         is_offload_optimizer_states_in_train_step = batch.meta_info.get("is_offload_optimizer_states_in_train_step", True)
         batch.meta_info['batch_num_tokens'] = self._get_batch_num_tokens(batch, dp_group=mpu.get_data_parallel_group())
@@ -1545,21 +1662,23 @@ class MegatronTrainStrategy(MegatronInferStrategy, TrainStrategy):
 
         data_iterator = [iter(micro_batches_list) for _ in range(len(self.model))]
 
-        metrics_tensors: List[Dict[str, "torch.Tensor"]] = self.forward_backward_func(
-            forward_step_func=partial(self.inner_forward_step, loss_func),
-            data_iterator=data_iterator,
-            model=self.model.get_models(),
-            num_microbatches=num_microbatches,
-            seq_length=self.seq_length,
-            micro_batch_size=mini_batch_size,
-            forward_only=False,
-        )
+        try:
+            metrics_tensors: List[Dict[str, "torch.Tensor"]] = self.forward_backward_func(
+                forward_step_func=partial(self.inner_forward_step, loss_func),
+                data_iterator=data_iterator,
+                model=self.model.get_models(),
+                num_microbatches=num_microbatches,
+                seq_length=self.seq_length,
+                micro_batch_size=mini_batch_size,
+                forward_only=False,
+            )
+        finally:
+            self._clear_sparse_attention_replay()
 
         # clear global router replay action
         if self.enable_router_replay:
             RouterReplay.clear_global_router_replay_action()
             RouterReplay.clear_global_indices()
-
         # 只有step的时候需要load optimizer states
         self.load_states(include=[OffloadStateType.optimizer_states])
 
