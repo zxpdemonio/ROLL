@@ -186,11 +186,17 @@ def set_router_replay_data(layers_topk_idx, tf_config, vp_rank=None):
 
         router_instances_list = RouterReplayHelper.get_micro_batch_router_list(tf_config, vp_rank)
 
-        layers_topk_idx = layers_topk_idx.permute(1, 0, 2, 3).contiguous()
-        layers_topk_idx = scatter_to_sequence_parallel_region(layers_topk_idx.to(get_device_name()))
+        fused = layers_topk_idx.is_cuda and mpu.get_tensor_model_parallel_world_size() == 1
+        if fused:
+            from roll.third_party.megatron.replay_kernels import prepare_router_indices
 
-        layers_topk_idx = layers_topk_idx.reshape(-1, layers_topk_idx.shape[2], layers_topk_idx.shape[3])
-        layers_topk_idx = layers_topk_idx.permute(1, 0, 2).contiguous()
+            layers_topk_idx = prepare_router_indices(layers_topk_idx, tf_config.num_moe_experts)
+        else:
+            layers_topk_idx = layers_topk_idx.permute(1, 0, 2, 3).contiguous()
+            layers_topk_idx = scatter_to_sequence_parallel_region(layers_topk_idx.to(get_device_name()))
+
+            layers_topk_idx = layers_topk_idx.reshape(-1, layers_topk_idx.shape[2], layers_topk_idx.shape[3])
+            layers_topk_idx = layers_topk_idx.permute(1, 0, 2).contiguous()
 
         num_layers_in_tensor = layers_topk_idx.shape[0]
         index_by_layer = (num_layers_in_tensor == tf_config.num_layers)
@@ -201,11 +207,11 @@ def set_router_replay_data(layers_topk_idx, tf_config, vp_rank=None):
             if not is_moe_layer(tf_config, layer_idx):
                 continue
             idx = layer_idx if index_by_layer else moe_idx
-            raw = layers_topk_idx[idx].to(torch.int64)
+            raw = layers_topk_idx[idx]
             # Sanitize invalid expert indices (e.g. -1 sentinels from SGLang, or 255 after
             # uint8 wrap). Out-of-range rows get dropped from routing_map, which desyncs
             # the MoE all-to-all split sizes against the dispatched token count.
-            target = raw.clamp(0, tf_config.num_moe_experts - 1)
+            target = raw if fused else raw.to(torch.int64).clamp(0, tf_config.num_moe_experts - 1)
             router_instances_list[router_offset].set_target_indices(target)
             router_offset += 1
             moe_idx += 1

@@ -745,6 +745,20 @@ class PPOConfig(BaseConfig):
         assert self.async_generation_ratio == 0 or self.generate_opt_level == 1
 
         profile = self.actor_infer.attention_selection_profile
+        if self.transfer_backend is not None and self.transfer_backend.backend_name == "Mooncake":
+            backend_config = self.transfer_backend.backend_config
+            if backend_config is None:
+                backend_config = self.transfer_backend.backend_config = {}
+            direct_fields = {}
+            if profile is not None:
+                direct_fields["attention_selection"] = profile.row_alignment_bytes or 4
+                direct_fields["attention_selection_valid_count"] = 4
+            if self.actor_train.router_replay.mode == "R3":
+                direct_fields["routed_experts"] = 1
+            # An explicit empty mapping retains the compatibility path. Normal
+            # replay jobs use consumer-process GPU reads without a Ray payload.
+            backend_config.setdefault("direct_read_fields", direct_fields)
+            backend_config.setdefault("direct_read_device", "cuda")
         if profile is not None:
             train_profile = self.actor_train.attention_selection_profile
             if train_profile is None:

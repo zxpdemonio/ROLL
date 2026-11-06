@@ -1032,11 +1032,12 @@ class ColumnRemoteBatch(RemoteBatch):
                 children = [batch.clone(recurse=recurse) for batch in value]
                 cloned_children[id(value)] = children
             cloned_fields[key] = children
+        cache = self._transform_cache() if recurse else self.cache
         return ColumnRemoteBatch(
             partition=self.partition,
             device=self.device,
             fields=cloned_fields,
-            cache=self.cache.clone(recurse=recurse) if self.cache is not None else None,
+            cache=cache.clone(recurse=recurse) if cache is not None else None,
             batch_size=self.batch_size,
             row_ids=self._row_ids,
             field_pipelines={key: self._field_pipelines[key] for key in cloned_fields},
@@ -1052,8 +1053,59 @@ class ColumnRemoteBatch(RemoteBatch):
         self._ensure_active()
         super().to(device)
         if self.cache is not None:
-            self.cache = self.cache.to(device)
+            target = torch.device(device)
+            if target.type == "cuda" and target.index is None:
+                target = torch.device("cuda", torch.cuda.current_device())
+            direct = [
+                key
+                for key in self.cache.keys()
+                if self._is_direct_field(key)
+                and self.cache[key].device.type == target.type
+                and (target.index is None or self.cache[key].device.index == target.index)
+            ]
+            retained = self.cache.select(*direct) if direct else None
+            ordinary = self._transform_cache()
+            if ordinary is not None:
+                ordinary = ordinary.to(device)
+            self.cache = ordinary
+            if retained is not None:
+                self._cache_data(retained)
         return self
+
+    def _is_direct_field(self, field: str) -> bool:
+        source = self.fields[field]
+        if isinstance(source, list):
+            return any(chunk._is_direct_field(field) for chunk in source)
+        return bool(source.get("direct"))
+
+    def _transform_cache(self):
+        if self.cache is None:
+            return None
+        keys = [key for key in self.cache.keys() if not self._is_direct_field(key)]
+        return self.cache.select(*keys) if keys else None
+
+    def _direct_row_metadata(self, fields: list[str], sources: list) -> TensorDict:
+        """Apply the existing row operators to tiny routing metadata only."""
+        source = self.fields[fields[0]]
+        if isinstance(source, list):
+            data = [chunk._direct_row_metadata(fields, sources) for chunk in source]
+        else:
+            descriptors = {field: self.fields[field] for field in fields}
+            if not all(value.get("direct") for value in descriptors.values()):
+                raise ValueError("Cannot mix direct and staged sources in a direct column")
+            source_index = len(sources)
+            sources.append(descriptors)
+            size = descriptors[fields[0]]["shape"][0]
+            data = TensorDict(
+                {
+                    "source": torch.full((size,), source_index, dtype=torch.int64),
+                    "row": torch.arange(size),
+                },
+                batch_size=[size],
+            )
+        for operator in self._field_pipelines[fields[0]]:
+            data = operator.execute(data)
+        return data
 
     def materialize(self, fields: list[str] = None) -> TensorDict:
         self._ensure_active()
@@ -1071,12 +1123,27 @@ class ColumnRemoteBatch(RemoteBatch):
             source = self.fields[field]
             pipeline = self._field_pipelines[field]
             source_key = ("nested", id(source)) if isinstance(source, list) else ("direct",)
-            groups.setdefault(source_key + tuple(id(op) for op in pipeline), []).append(field)
+            groups.setdefault(
+                source_key + tuple(id(op) for op in pipeline) + (self._is_direct_field(field),), []
+            ).append(field)
 
         for group_fields in groups.values():
             source = self.fields[group_fields[0]]
             pipeline = self._field_pipelines[group_fields[0]]
-            if isinstance(source, list):
+            direct = self._is_direct_field(group_fields[0])
+            if direct:
+                sources = []
+                routing = self._direct_row_metadata(group_fields, sources)
+                device_kwargs = {"device": self.device} if self.device is not None else {}
+                data = transfer_backend.get_direct(
+                    self.partition,
+                    group_fields,
+                    sources,
+                    list(zip(routing["source"].tolist(), routing["row"].tolist())),
+                    **device_kwargs,
+                )
+                pipeline = ()
+            elif isinstance(source, list):
                 data = [chunk.materialize(group_fields) for chunk in source]
             else:
                 data = transfer_backend.get(
@@ -1089,7 +1156,7 @@ class ColumnRemoteBatch(RemoteBatch):
             for operator in pipeline:
                 data = operator.execute(data)
             assert len(data) == self.batch_size
-            if self.device is not None:
+            if self.device is not None and not direct:
                 data = data.to(self.device)
             self._cache_data(data)
 
@@ -1128,7 +1195,7 @@ class ColumnRemoteBatch(RemoteBatch):
             self._ensure_active()
         batch_size = plan.batch_size
 
-        cache = self.cache
+        cache = self._transform_cache()
         if cache is not None:
             cache = plan.execute(cache)
             assert isinstance(cache, TensorDict)
@@ -1283,7 +1350,7 @@ class ColumnRemoteBatch(RemoteBatch):
         batch_size = sum(d.batch_size for d in data)
         plan = CatPlan(batch_size)
 
-        caches = [d.cache for d in data]
+        caches = [d._transform_cache() for d in data]
         if all(c is not None for c in caches):
             first_keys = set(caches[0].keys())
             if all(set(c.keys()) == first_keys for c in caches[1:]):

@@ -137,6 +137,13 @@ def get(partition, keys: list[str], fields: list[Any]):
     return _client.get(partition, keys, fields)
 
 
+def get_direct(partition, keys, sources, row_plan, *, device=None):
+    init_client()
+    if not isinstance(_client, MooncakeNodeClientProxy):
+        raise RuntimeError("Direct column references require the Mooncake backend")
+    return _client.get_direct(partition, keys, sources, row_plan, device=device)
+
+
 def delete(partition, keys: list[str], fields: list[Any]):
     init_client()
     return _client.delete(partition, keys, fields)
@@ -331,6 +338,8 @@ class MooncakeNodeTransferActor:
 class MooncakeNodeClientProxy:
     def __init__(self, config: dict[str, Any] | None = None):
         self.config = dict(config or {})
+        self._direct_client = None
+        self._direct_lock = threading.Lock()
         self.actor = self._get_node_actor()
 
     def put(
@@ -341,11 +350,56 @@ class MooncakeNodeClientProxy:
         batch_size: int,
     ):
         remote = ray.get(self.actor.put.remote(partition, row_ids, fields, batch_size))
-        remote.cache = create_tensordict(fields)
+        cached = {key: value for key, value in fields.items() if not remote.fields[key].get("direct")}
+        remote.cache = create_tensordict(cached) if cached else None
         return remote
 
     def get(self, partition, keys: list[str], fields: list[Any]):
+        direct_pairs = [(key, field) for key, field in zip(keys, fields) if field.get("direct")]
+        if direct_pairs and len(direct_pairs) != len(fields):
+            plain_pairs = [(key, field) for key, field in zip(keys, fields) if not field.get("direct")]
+            plain = self.get(partition, *map(list, zip(*plain_pairs)))
+            direct = self.get(partition, *map(list, zip(*direct_pairs)))
+            return create_tensordict(
+                {key: (direct if field.get("direct") else plain)[key] for key, field in zip(keys, fields)}
+            )
+        if fields and all(field.get("direct") for field in fields):
+            size = fields[0]["shape"][0]
+            return self.get_direct(partition, keys, [dict(zip(keys, fields))], [(0, row) for row in range(size)])
         return ray.get(ray.get(self.actor.get.remote(partition, keys, fields)))
+
+    def get_direct(self, partition, keys, sources, row_plan, *, device=None):
+        with self._direct_lock:
+            return self._get_direct_locked(partition, keys, sources, row_plan, device)
+
+    def _get_direct_locked(self, partition, keys, sources, row_plan, device):
+        from roll.distributed.scheduler.mooncake_direct import read_direct_columns
+
+        if self._direct_client is None:
+            config = dict(self.config)
+            config["global_segment_size"] = 0
+            self._direct_client = MooncakeClient(config)
+        backend = self._direct_client.backend
+        pending, backend._roll_pending_direct_registrations = backend._roll_pending_direct_registrations, []
+        for target in pending:
+            try:
+                status = backend.store.unregister_buffer(target.data_ptr())
+                if status != 0:
+                    raise RuntimeError(f"Mooncake pending deregistration failed: {status}")
+            except Exception:
+                backend._roll_pending_direct_registrations.append(target)
+        if backend._roll_pending_direct_registrations:
+            raise RuntimeError("Mooncake has pending direct destination deregistrations")
+        return create_tensordict(
+            read_direct_columns(
+                backend,
+                keys,
+                sources,
+                row_plan,
+                alignments=self.config.get("direct_read_fields", {}),
+                device=device if device is not None else self.config.get("direct_read_device", "cuda"),
+            )
+        )
 
     def delete(self, partition, keys: list[str], fields: list[Any]):
         return ray.get(self.actor.delete.remote(partition, keys, fields))
@@ -383,6 +437,16 @@ class MooncakeClient:
             raise RuntimeError(f"Mooncake store setup failed, return code={ret}")
 
         self.backend = MooncakeBundleTransfer(store, key_prefix=config.get("key_prefix", "roll"))
+        self.backend._roll_pending_direct_registrations = []
+        self.direct_read_fields = config.get("direct_read_fields", {})
+        for key, alignment in self.direct_read_fields.items():
+            if (
+                isinstance(alignment, bool)
+                or not isinstance(alignment, int)
+                or alignment <= 0
+                or alignment & (alignment - 1)
+            ):
+                raise ValueError(f"direct_read_fields[{key!r}] must be a positive power of two")
         policy_config = config.get("transfer_policy")
         self.transfer_policy = BundleTransferPolicy(**policy_config) if policy_config else None
         self.field_schemas = self._build_field_schemas(config.get("field_schemas"), FieldSchema)
@@ -417,9 +481,18 @@ class MooncakeClient:
         field_refs = {
             key: {"ref": ref, "kind": "batch" if key in batch_fields else "non_tensor"} for key in fields.keys()
         }
+        for key, tensor in batch_fields.items():
+            if key in self.direct_read_fields:
+                field_refs[key].update(
+                    shape=list(tensor.shape),
+                    dtype=str(tensor.dtype),
+                    direct=True,
+                )
         return ColumnRemoteBatch(
             partition=partition,
-            device=next(iter(batch_fields.values())).device if batch_fields else None,
+            device=None
+            if self.direct_read_fields
+            else (next(iter(batch_fields.values())).device if batch_fields else None),
             fields=field_refs,
             cache=None,
             batch_size=batch_size,

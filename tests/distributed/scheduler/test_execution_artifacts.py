@@ -6,7 +6,7 @@ import torch
 from tensordict import TensorDict
 
 from roll.configs import GeneratingArguments
-from roll.configs.base_config import PPOConfig
+from roll.configs.base_config import PPOConfig, TransferBackendArguments
 from roll.configs.worker_config import StrategyArguments, WorkerConfig
 from roll.distributed.scheduler.protocol import DataProto
 from roll.utils.execution_artifacts import (
@@ -15,7 +15,10 @@ from roll.utils.execution_artifacts import (
     pack_attention_selection,
     unpack_attention_selection,
 )
-from roll.utils.functionals import hold_aside_actor_replay_artifacts, postprocess_generate
+from roll.utils.functionals import (
+    hold_aside_actor_replay_artifacts,
+    postprocess_generate,
+)
 
 
 @pytest.fixture
@@ -270,9 +273,7 @@ def test_decode_attention_selection_from_base64(profile):
 
 
 def test_decode_attention_selection_reuses_writable_int32_numpy_storage(profile):
-    values = np.arange(3 * profile.row_width, dtype=np.int32).reshape(
-        3, profile.num_layers, profile.topk
-    )
+    values = np.arange(3 * profile.row_width, dtype=np.int32).reshape(3, profile.num_layers, profile.topk)
 
     decoded = decode_attention_selection(values, profile, expected_rows=3)
 
@@ -316,9 +317,7 @@ def test_pack_attention_selection_aligns_each_stored_row():
         topk=3,
         row_alignment_bytes=64,
     )
-    selection = torch.arange(2 * profile.row_width, dtype=torch.int32).reshape(
-        2, profile.num_layers, profile.topk
-    )
+    selection = torch.arange(2 * profile.row_width, dtype=torch.int32).reshape(2, profile.num_layers, profile.topk)
 
     packed, valid_counts = pack_attention_selection(
         [selection],
@@ -444,3 +443,30 @@ def test_hold_aside_actor_replay_artifacts_ignores_realign_key_when_empty():
         pass
 
     torch.testing.assert_close(batch.batch["tokens"], torch.tensor([[10]]))
+
+
+@pytest.mark.parametrize("compatibility", [False, True])
+def test_mooncake_replay_defaults_to_consumer_direct_reads(profile, compatibility):
+    settings = {"direct_read_fields": {}} if compatibility else {}
+    config = PPOConfig(
+        sequence_length=5,
+        rollout_batch_size=2,
+        execution_artifact_max_inflight_bytes=profile.estimate_payload_bytes(4) * 2,
+        execution_artifact_max_batch_bytes=profile.estimate_packed_bytes(4, batch_size=2),
+        actor_infer=WorkerConfig(
+            strategy_args=StrategyArguments(strategy_name="sglang"),
+            generating_args=GeneratingArguments(num_return_sequences=1),
+            attention_selection_profile=profile,
+        ),
+        transfer_backend=TransferBackendArguments(backend_name="Mooncake", backend_config=settings),
+    )
+    expected = (
+        {}
+        if compatibility
+        else {
+            "attention_selection": profile.row_alignment_bytes or 4,
+            "attention_selection_valid_count": 4,
+        }
+    )
+    assert config.transfer_backend.backend_config["direct_read_fields"] == expected
+    assert config.transfer_backend.backend_config["direct_read_device"] == "cuda"

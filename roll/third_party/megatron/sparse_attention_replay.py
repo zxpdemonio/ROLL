@@ -270,6 +270,13 @@ def prepare_sparse_attention_layer(
 
     batch_size, stored_length, topk = selection.shape
 
+    if selection.is_cuda:
+        from roll.third_party.megatron.replay_kernels import prepare_attention_indices
+
+        if valid_counts.device != selection.device:
+            raise ValueError("CUDA replay counts and selections must be on the same device")
+        return prepare_attention_indices(selection, valid_counts, query_length)
+
     result = torch.zeros(
         (batch_size, query_length, topk),
         dtype=torch.int64,

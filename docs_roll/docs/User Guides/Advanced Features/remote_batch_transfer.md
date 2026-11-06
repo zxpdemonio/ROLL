@@ -172,9 +172,33 @@ The other ROLL pipeline launchers accept the same configuration fields. A succes
 
 Mooncake stores each uploaded ROLL DataProto fragment as a structured object. A logical DataProto may reference several such objects after union or concatenation. Tensor fields remain in the `batch` section, NumPy fields remain in `non_tensor_batch`, and ROLL's original `meta_info` continues through the existing lightweight control path. `ColumnRemoteBatch.materialize(fields)` requests only the selected fields, while `ColumnRemoteBatch.drop()` removes the referenced remote objects.
 
-The Mooncake GET lease belongs to the node actor. After placing a serializable view in the local Ray object store, the actor releases the BufferPool lease; a failed release is retried by a later Mooncake operation. Selections, slices, unions, and concatenations retain the original row order.
+For ordinary fields, the Mooncake GET lease belongs to the node actor. After placing a serializable view in the local Ray object store, the actor releases the BufferPool lease; a failed release is retried by a later Mooncake operation. Selections, slices, unions, and concatenations retain the original row order.
 
 Local aliases share cleanup state, but ROLL does not provide a cross-process reference counter or invalidation broadcast. The framework must designate one cleanup path and call `drop()` only after every consumer has finished. `drop()` removes the physical remote objects; other processes holding old handles are not notified automatically and must not use them afterward.
+
+#### 5. Direct GPU reads for replay fields
+
+Mooncake replay jobs read selection indices in the consuming training process. Ray carries references and row metadata; direct payloads do not return through the node actor's GET or Ray object store. The consumer allocates and registers the output tensor, and Mooncake writes selected rows directly into it. Slice, select, repeat, and concatenation use the existing row plan before materialization.
+
+With an attention-selection profile, PPO defaults to direct reads for `attention_selection` and `attention_selection_valid_count`; R3 also enables `routed_experts`. Override consumer alignment and device when required:
+
+```yaml
+transfer_backend:
+  backend_name: Mooncake
+  backend_config:
+    direct_read_device: cuda
+    direct_read_fields:
+      attention_selection: 4096
+      attention_selection_valid_count: 4
+      routed_experts: 64
+```
+
+These numbers constrain output allocation addresses. Model row padding remains part of the attention-selection profile. Interior scatter fragments need only their actual transport/dtype alignment, so short R3 rows can be selected without padding every row to 4 KiB. An explicit `direct_read_fields: {}` selects the compatibility path.
+
+This requires Mooncake's `tensor_destination` and native strict range-read support. Unsupported device/transport combinations fail instead of silently staging through CPU memory. The first implementation supports tested classic-TE GPU direct paths; TENT strict destinations are not enabled until physical-drain semantics are available. PUT `copy_mode` does not determine GET directness; ROLL's plain tensor PUT continues to use `copy` or `auto`, while Mooncake's strict zero-copy PUT requires registered tensor-object sources.
+
+Transport registration ends after synchronous physical completion; the tensor allocation remains alive for GPU replay, recomputation, and backward. Failed deregistration retains its allocation for retry. On GPU, DSA normalization and int32-to-int64 conversion are fused; R3 also fuses its layout conversion at TP=1. Other parallel layouts retain their existing scatter behavior.
+
 
 - `backend_name`: The name of the transfer backend to use.
   - `TransferQueue` (default): Uses the TransferQueue library for high-performance data transfer. This is the default behavior when `transfer_backend` is not configured.
