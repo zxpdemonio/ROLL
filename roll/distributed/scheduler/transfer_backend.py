@@ -144,6 +144,10 @@ def get_direct(partition, keys, sources, row_plan, *, device=None):
     return _client.get_direct(partition, keys, sources, row_plan, device=device)
 
 
+def requires_direct(field):
+    return isinstance(field, Mapping) and field.get("schema", {}).get("direct_alignment") is not None
+
+
 def delete(partition, keys: list[str], fields: list[Any]):
     init_client()
     return _client.delete(partition, keys, fields)
@@ -350,20 +354,20 @@ class MooncakeNodeClientProxy:
         batch_size: int,
     ):
         remote = ray.get(self.actor.put.remote(partition, row_ids, fields, batch_size))
-        cached = {key: value for key, value in fields.items() if not remote.fields[key].get("direct")}
+        cached = {key: value for key, value in fields.items() if not requires_direct(remote.fields[key])}
         remote.cache = create_tensordict(cached) if cached else None
         return remote
 
     def get(self, partition, keys: list[str], fields: list[Any]):
-        direct_pairs = [(key, field) for key, field in zip(keys, fields) if field.get("direct")]
+        direct_pairs = [(key, field) for key, field in zip(keys, fields) if requires_direct(field)]
         if direct_pairs and len(direct_pairs) != len(fields):
-            plain_pairs = [(key, field) for key, field in zip(keys, fields) if not field.get("direct")]
+            plain_pairs = [(key, field) for key, field in zip(keys, fields) if not requires_direct(field)]
             plain = self.get(partition, *map(list, zip(*plain_pairs)))
             direct = self.get(partition, *map(list, zip(*direct_pairs)))
             return create_tensordict(
-                {key: (direct if field.get("direct") else plain)[key] for key, field in zip(keys, fields)}
+                {key: (direct if requires_direct(field) else plain)[key] for key, field in zip(keys, fields)}
             )
-        if fields and all(field.get("direct") for field in fields):
+        if fields and all(requires_direct(field) for field in fields):
             size = fields[0]["shape"][0]
             return self.get_direct(partition, keys, [dict(zip(keys, fields))], [(0, row) for row in range(size)])
         return ray.get(ray.get(self.actor.get.remote(partition, keys, fields)))
@@ -396,7 +400,6 @@ class MooncakeNodeClientProxy:
                 keys,
                 sources,
                 row_plan,
-                alignments=self.config.get("direct_read_fields", {}),
                 device=device if device is not None else self.config.get("direct_read_device", "cuda"),
             )
         )
@@ -431,6 +434,8 @@ class MooncakeClient:
         )
 
         config = config or {}
+        if "direct_read_fields" in config:
+            raise ValueError("Declare direct_alignment in field_schemas instead of direct_read_fields")
         store = MooncakeDistributedStore()
         ret = self._setup_store(store, config)
         if ret != 0:
@@ -438,15 +443,6 @@ class MooncakeClient:
 
         self.backend = MooncakeBundleTransfer(store, key_prefix=config.get("key_prefix", "roll"))
         self.backend._roll_pending_direct_registrations = []
-        self.direct_read_fields = config.get("direct_read_fields", {})
-        for key, alignment in self.direct_read_fields.items():
-            if (
-                isinstance(alignment, bool)
-                or not isinstance(alignment, int)
-                or alignment <= 0
-                or alignment & (alignment - 1)
-            ):
-                raise ValueError(f"direct_read_fields[{key!r}] must be a positive power of two")
         policy_config = config.get("transfer_policy")
         self.transfer_policy = BundleTransferPolicy(**policy_config) if policy_config else None
         self.field_schemas = self._build_field_schemas(config.get("field_schemas"), FieldSchema)
@@ -482,16 +478,17 @@ class MooncakeClient:
             key: {"ref": ref, "kind": "batch" if key in batch_fields else "non_tensor"} for key in fields.keys()
         }
         for key, tensor in batch_fields.items():
-            if key in self.direct_read_fields:
+            schema = self.field_schemas.get(key)
+            if schema is not None and schema.direct_alignment is not None:
                 field_refs[key].update(
                     shape=list(tensor.shape),
                     dtype=str(tensor.dtype),
-                    direct=True,
+                    schema={"codec": schema.codec, "direct_alignment": schema.direct_alignment},
                 )
         return ColumnRemoteBatch(
             partition=partition,
             device=None
-            if self.direct_read_fields
+            if any(requires_direct(field) for field in field_refs.values())
             else (next(iter(batch_fields.values())).device if batch_fields else None),
             fields=field_refs,
             cache=None,

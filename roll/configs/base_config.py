@@ -749,15 +749,30 @@ class PPOConfig(BaseConfig):
             backend_config = self.transfer_backend.backend_config
             if backend_config is None:
                 backend_config = self.transfer_backend.backend_config = {}
-            direct_fields = {}
+            schemas = backend_config.setdefault("field_schemas", {})
             if profile is not None:
-                direct_fields["attention_selection"] = profile.row_alignment_bytes or 4
-                direct_fields["attention_selection_valid_count"] = 4
+                schemas.setdefault(
+                    "attention_selection",
+                    {
+                        "codec": "torch_tensor",
+                        "direct_alignment": profile.row_alignment_bytes or 4,
+                    },
+                )
+                schemas.setdefault(
+                    "attention_selection_valid_count",
+                    {
+                        "codec": "torch_tensor",
+                        "direct_alignment": 4,
+                    },
+                )
             if self.actor_train.router_replay.mode == "R3":
-                direct_fields["routed_experts"] = 1
-            # An explicit empty mapping retains the compatibility path. Normal
-            # replay jobs use consumer-process GPU reads without a Ray payload.
-            backend_config.setdefault("direct_read_fields", direct_fields)
+                schemas.setdefault(
+                    "routed_experts",
+                    {
+                        "codec": "torch_tensor",
+                        "direct_alignment": 1,
+                    },
+                )
             backend_config.setdefault("direct_read_device", "cuda")
         if profile is not None:
             train_profile = self.actor_train.attention_selection_profile

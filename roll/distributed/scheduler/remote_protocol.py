@@ -1073,10 +1073,13 @@ class ColumnRemoteBatch(RemoteBatch):
         return self
 
     def _is_direct_field(self, field: str) -> bool:
+        return any(self._direct_schema_signature(field))
+
+    def _direct_schema_signature(self, field: str) -> tuple[bool, ...]:
         source = self.fields[field]
         if isinstance(source, list):
-            return any(chunk._is_direct_field(field) for chunk in source)
-        return bool(source.get("direct"))
+            return tuple(flag for chunk in source for flag in chunk._direct_schema_signature(field))
+        return (transfer_backend.requires_direct(source),)
 
     def _transform_cache(self):
         if self.cache is None:
@@ -1091,11 +1094,10 @@ class ColumnRemoteBatch(RemoteBatch):
             data = [chunk._direct_row_metadata(fields, sources) for chunk in source]
         else:
             descriptors = {field: self.fields[field] for field in fields}
-            if not all(value.get("direct") for value in descriptors.values()):
-                raise ValueError("Cannot mix direct and staged sources in a direct column")
             source_index = len(sources)
             sources.append(descriptors)
-            size = descriptors[fields[0]]["shape"][0]
+            descriptor = descriptors[fields[0]]
+            size = descriptor["shape"][0] if "shape" in descriptor else descriptor["ref"].batch_size
             data = TensorDict(
                 {
                     "source": torch.full((size,), source_index, dtype=torch.int64),
@@ -1106,6 +1108,27 @@ class ColumnRemoteBatch(RemoteBatch):
         for operator in self._field_pipelines[fields[0]]:
             data = operator.execute(data)
         return data
+
+    def _materialize_routed_rows(self, fields, sources, rows):
+        active = sorted({source for source, _ in rows})
+        contracts = [transfer_backend.requires_direct(sources[index][field]) for index in active for field in fields]
+        if all(contracts):
+            device_kwargs = {"device": self.device} if self.device is not None else {}
+            return transfer_backend.get_direct(self.partition, fields, sources, rows, **device_kwargs), True
+        if any(contracts):
+            raise ValueError("Cannot combine selected rows with direct and ordinary schemas")
+        # Only ordinary rows remain after selection. Reuse the normal GET and
+        # row operators without materializing any inactive direct source.
+        parts, offsets, size = [], {}, 0
+        for index in active:
+            part = transfer_backend.get(self.partition, fields, [sources[index][field] for field in fields])
+            part = _densify_uniform_nested_fields(part)
+            offsets[index] = size
+            size += len(part)
+            parts.append(part)
+        data = parts[0] if len(parts) == 1 else CatPlan(size).execute(parts)
+        indices = torch.tensor([offsets[index] + row for index, row in rows], dtype=torch.int64)
+        return SelectPlan(indices).execute(data), False
 
     def materialize(self, fields: list[str] = None) -> TensorDict:
         self._ensure_active()
@@ -1124,7 +1147,7 @@ class ColumnRemoteBatch(RemoteBatch):
             pipeline = self._field_pipelines[field]
             source_key = ("nested", id(source)) if isinstance(source, list) else ("direct",)
             groups.setdefault(
-                source_key + tuple(id(op) for op in pipeline) + (self._is_direct_field(field),), []
+                source_key + tuple(id(op) for op in pipeline) + (self._direct_schema_signature(field),), []
             ).append(field)
 
         for group_fields in groups.values():
@@ -1134,13 +1157,10 @@ class ColumnRemoteBatch(RemoteBatch):
             if direct:
                 sources = []
                 routing = self._direct_row_metadata(group_fields, sources)
-                device_kwargs = {"device": self.device} if self.device is not None else {}
-                data = transfer_backend.get_direct(
-                    self.partition,
+                data, direct = self._materialize_routed_rows(
                     group_fields,
                     sources,
                     list(zip(routing["source"].tolist(), routing["row"].tolist())),
-                    **device_kwargs,
                 )
                 pipeline = ()
             elif isinstance(source, list):

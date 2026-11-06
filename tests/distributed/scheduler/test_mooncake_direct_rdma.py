@@ -25,10 +25,10 @@ def test_replay_columns_read_without_actor_payload(monkeypatch, mode, device):
         "local_buffer_size": 64 * 1024 * 1024,
         "key_prefix": "test-roll-direct-replay",
         "transfer_policy": {"copy_mode": mode},
-        "direct_read_fields": {
-            "attention_selection": 4096,
-            "attention_selection_valid_count": 4,
-            "routed_experts": 64,
+        "field_schemas": {
+            "attention_selection": {"codec": "torch_tensor", "direct_alignment": 4096},
+            "attention_selection_valid_count": {"codec": "torch_tensor", "direct_alignment": 4},
+            "routed_experts": {"codec": "torch_tensor", "direct_alignment": 64},
         },
         "direct_read_device": device,
     }
@@ -58,7 +58,8 @@ def test_replay_columns_read_without_actor_payload(monkeypatch, mode, device):
         result = batch.materialize()
         expected_rows = [(1, 2), (0, 1), (1, 1), (0, 2)]
         expected_rows = [pair for pair in expected_rows for _ in range(2)]
-        for key, alignment in config["direct_read_fields"].items():
+        for key, schema in config["field_schemas"].items():
+            alignment = schema["direct_alignment"]
             target = result[key]
             assert target.device.type == device
             assert target.data_ptr() % alignment == 0

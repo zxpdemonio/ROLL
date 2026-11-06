@@ -5,7 +5,7 @@ import math
 import torch
 
 
-def read_direct_columns(backend, keys, sources, row_plan, *, alignments, device):
+def read_direct_columns(backend, keys, sources, row_plan, *, device):
     """Execute row routing with metadata only; DMA writes the final tensor.
 
     ``sources`` are column reference dictionaries. ``row_plan`` contains
@@ -20,16 +20,27 @@ def read_direct_columns(backend, keys, sources, row_plan, *, alignments, device)
     failure = None
     try:
         for key in keys:
-            spec = sources[0][key]
+            used = {source for source, _ in row_plan}
+            if not used:
+                used = {
+                    next(
+                        i
+                        for i, source in enumerate(sources)
+                        if source[key].get("schema", {}).get("direct_alignment") is not None
+                    )
+                }
+            spec = sources[min(used)][key]
             dtype = getattr(torch, spec["dtype"].removeprefix("torch."))
-            alignment = alignments[key]
-            if (
+            alignments = [sources[index][key].get("schema", {}).get("direct_alignment") for index in used]
+            if any(
                 isinstance(alignment, bool)
                 or not isinstance(alignment, int)
                 or alignment <= 0
                 or alignment & (alignment - 1)
+                for alignment in alignments
             ):
-                raise ValueError("direct alignment must be a positive power of two")
+                raise ValueError("direct sources require schemas with a positive power-of-two direct_alignment")
+            alignment = max(alignments)
             if not isinstance(dtype, torch.dtype) or torch.device(device).type not in {"cpu", "cuda"}:
                 raise ValueError("direct destination requires a CPU/CUDA tensor dtype")
             if not spec["shape"] or any(
@@ -70,7 +81,9 @@ def read_direct_columns(backend, keys, sources, row_plan, *, alignments, device)
                         # The allocation base satisfies the consumer alignment.
                         # A run can begin at an interior row offset; it only
                         # needs the dtype's natural alignment for the DMA write.
-                        key: tensor_destination(destination, alignment=target.element_size(), pre_registered=True)
+                        key: tensor_destination(
+                            destination, alignment=alignment, pre_registered=True, allocation=target
+                        )
                     },
                 )
                 if result["batch"][key] is not destination:

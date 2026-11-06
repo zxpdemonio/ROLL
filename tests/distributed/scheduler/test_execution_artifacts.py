@@ -447,7 +447,16 @@ def test_hold_aside_actor_replay_artifacts_ignores_realign_key_when_empty():
 
 @pytest.mark.parametrize("compatibility", [False, True])
 def test_mooncake_replay_defaults_to_consumer_direct_reads(profile, compatibility):
-    settings = {"direct_read_fields": {}} if compatibility else {}
+    settings = (
+        {
+            "field_schemas": {
+                "attention_selection": {"codec": "torch_tensor"},
+                "attention_selection_valid_count": {"codec": "torch_tensor"},
+            }
+        }
+        if compatibility
+        else {}
+    )
     config = PPOConfig(
         sequence_length=5,
         rollout_batch_size=2,
@@ -460,13 +469,10 @@ def test_mooncake_replay_defaults_to_consumer_direct_reads(profile, compatibilit
         ),
         transfer_backend=TransferBackendArguments(backend_name="Mooncake", backend_config=settings),
     )
-    expected = (
-        {}
-        if compatibility
-        else {
-            "attention_selection": profile.row_alignment_bytes or 4,
-            "attention_selection_valid_count": 4,
-        }
+    schemas = config.transfer_backend.backend_config["field_schemas"]
+    assert "direct_read_fields" not in config.transfer_backend.backend_config
+    assert schemas["attention_selection"].get("direct_alignment") == (
+        None if compatibility else profile.row_alignment_bytes or 4
     )
-    assert config.transfer_backend.backend_config["direct_read_fields"] == expected
+    assert schemas["attention_selection_valid_count"].get("direct_alignment") == (None if compatibility else 4)
     assert config.transfer_backend.backend_config["direct_read_device"] == "cuda"

@@ -9,13 +9,13 @@ from roll.distributed.scheduler.mooncake_direct import read_direct_columns
 from roll.distributed.scheduler.remote_protocol import ColumnRemoteBatch
 
 
-def descriptor(ref, shape=(3, 2, 16)):
+def descriptor(ref, shape=(3, 2, 16), alignment=64):
     return {
         "ref": ref,
         "kind": "batch",
         "shape": list(shape),
         "dtype": "torch.int32",
-        "direct": True,
+        "schema": {"codec": "torch_tensor", "direct_alignment": alignment},
     }
 
 
@@ -46,6 +46,7 @@ class FakeDirectBackend:
             target = destination.tensor
             self.destinations.append(target)
             assert target.data_ptr() % target.element_size() == 0
+            assert destination.allocation.data_ptr() % destination.alignment == 0
             for index, row in enumerate(rows):
                 target[index].fill_(ref * 10 + row)
             targets[key] = target
@@ -54,7 +55,7 @@ class FakeDirectBackend:
 
 @pytest.fixture
 def tensor_destination_stub(monkeypatch):
-    module = SimpleNamespace(tensor_destination=lambda tensor, **kwargs: SimpleNamespace(tensor=tensor))
+    module = SimpleNamespace(tensor_destination=lambda tensor, **kwargs: SimpleNamespace(tensor=tensor, **kwargs))
     monkeypatch.setitem(sys.modules, "mooncake.structured_object_store", module)
 
 
@@ -66,7 +67,6 @@ def test_direct_columns_gather_into_final_allocation(tensor_destination_stub):
         ["attention_selection"],
         sources,
         [(1, 2), (0, 1), (0, 1), (1, 0)],
-        alignments={"attention_selection": 64},
         device="cpu",
     )["attention_selection"]
     assert output[:, 0, 0].tolist() == [22, 11, 11, 20]
@@ -83,7 +83,6 @@ def test_direct_columns_deregister_after_synchronous_read_failure(tensor_destina
             ["routed_experts"],
             [{"routed_experts": descriptor(1)}],
             [(0, 0)],
-            alignments={"routed_experts": 64},
             device="cpu",
         )
     assert not backend.registered
@@ -98,7 +97,6 @@ def test_direct_columns_retain_failed_deregistrations(tensor_destination_stub):
             ["routed_experts"],
             [{"routed_experts": descriptor(1)}],
             [(0, 0)],
-            alignments={"routed_experts": 64},
             device="cpu",
         )
     assert len(backend._roll_pending_direct_registrations) == 1
@@ -188,8 +186,113 @@ def test_direct_small_r3_rows_keep_root_alignment(tensor_destination_stub):
         ["routed_experts"],
         sources,
         [(0, 0), (1, 1)],
-        alignments={"routed_experts": 64},
         device="cpu",
     )["routed_experts"]
     assert output.data_ptr() % 64 == 0
     assert output[:, 0, 0].tolist() == [10, 21]
+
+
+def test_schema_controls_directness_independently_of_field_name():
+    backend = transfer_backend.MooncakeClient.__new__(transfer_backend.MooncakeClient)
+    backend._pending_release_results = []
+    backend.transfer_policy = None
+    backend.backend = SimpleNamespace(put=lambda data, **kwargs: "ref")
+    backend.field_schemas = {
+        "custom_replay": SimpleNamespace(codec="torch_tensor", direct_alignment=64),
+    }
+    remote = backend.put(
+        "rollout",
+        ["a", "b"],
+        {
+            "attention_selection": torch.zeros(2, 16, dtype=torch.int32),
+            "routed_experts": torch.zeros(2, 8, dtype=torch.uint8),
+            "custom_replay": torch.zeros(2, 16, dtype=torch.int32),
+        },
+        2,
+    )
+    assert not transfer_backend.requires_direct(remote.fields["attention_selection"])
+    assert not transfer_backend.requires_direct(remote.fields["routed_experts"])
+    assert transfer_backend.requires_direct(remote.fields["custom_replay"])
+    assert "direct" not in remote.fields["custom_replay"]
+
+
+def test_direct_columns_reject_missing_schema(tensor_destination_stub):
+    spec = descriptor(1)
+    del spec["schema"]
+    with pytest.raises(ValueError, match="schemas"):
+        read_direct_columns(FakeDirectBackend(), ["value"], [{"value": spec}], [(0, 0)], device="cpu")
+
+
+@pytest.mark.parametrize("rows,kind", [([0], "direct"), ([2], "plain"), ([0, 2], "mixed")])
+def test_selected_rows_determine_schema_contract(monkeypatch, rows, kind):
+    direct_field = descriptor(1)
+    plain_field = {"ref": SimpleNamespace(batch_size=2), "kind": "batch"}
+    direct = ColumnRemoteBatch(
+        partition="replay",
+        device=None,
+        fields={"value": direct_field},
+        cache=None,
+        batch_size=3,
+        row_ids=["a", "b", "c"],
+    )
+    plain = ColumnRemoteBatch(
+        partition="replay", device=None, fields={"value": plain_field}, cache=None, batch_size=2, row_ids=["d", "e"]
+    )
+    # First source contributes two rows; index 2 belongs to the plain source.
+    selected = ColumnRemoteBatch._cat([direct.slice(0, 2), plain]).select_idxs(rows)
+    calls = []
+
+    def get_direct(partition, keys, sources, plan, **kwargs):
+        calls.append("direct")
+        assert all(sources[index]["value"].get("schema") for index, row in plan)
+        return transfer_backend.create_tensordict({"value": torch.ones(len(plan), 1)})
+
+    def get_plain(partition, keys, fields):
+        calls.append("plain")
+        assert fields == [plain_field]
+        return transfer_backend.create_tensordict({"value": torch.full((2, 1), 2.0)})
+
+    monkeypatch.setattr(transfer_backend, "get_direct", get_direct)
+    monkeypatch.setattr(transfer_backend, "get", get_plain)
+    if kind == "mixed":
+        with pytest.raises(ValueError, match="selected rows"):
+            selected.materialize()
+        assert calls == []
+    else:
+        result = selected.materialize()["value"]
+        assert calls == [kind]
+        assert result.item() == (1 if kind == "direct" else 2)
+
+
+def test_fields_are_grouped_by_their_own_source_schemas(monkeypatch):
+    def source(index, direct_key):
+        fields = {key: descriptor(index) for key in ("a", "b")}
+        fields["b" if direct_key == "a" else "a"].pop("schema")
+        return ColumnRemoteBatch(
+            partition="replay",
+            device=None,
+            fields=fields,
+            cache=None,
+            batch_size=3,
+            row_ids=[f"{index}-{row}" for row in range(3)],
+        )
+
+    batch = ColumnRemoteBatch._cat([source(1, "a"), source(2, "b")]).select_idxs([0])
+    calls = []
+
+    def direct(partition, keys, sources, rows, **kwargs):
+        assert keys == ["a"]
+        calls.append("direct")
+        return transfer_backend.create_tensordict({"a": torch.ones(len(rows), 1)})
+
+    def plain(partition, keys, fields):
+        assert keys == ["b"]
+        calls.append("plain")
+        return transfer_backend.create_tensordict({"b": torch.full((3, 1), 2.0)})
+
+    monkeypatch.setattr(transfer_backend, "get_direct", direct)
+    monkeypatch.setattr(transfer_backend, "get", plain)
+    result = batch.materialize()
+    assert result["a"].item() == 1
+    assert result["b"].item() == 2
+    assert sorted(calls) == ["direct", "plain"]

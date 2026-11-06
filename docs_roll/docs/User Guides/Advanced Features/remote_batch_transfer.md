@@ -180,20 +180,26 @@ Local aliases share cleanup state, but ROLL does not provide a cross-process ref
 
 Mooncake replay jobs read selection indices in the consuming training process. Ray carries references and row metadata; direct payloads do not return through the node actor's GET or Ray object store. The consumer allocates and registers the output tensor, and Mooncake writes selected rows directly into it. Slice, select, repeat, and concatenation use the existing row plan before materialization.
 
-With an attention-selection profile, PPO defaults to direct reads for `attention_selection` and `attention_selection_valid_count`; R3 also enables `routed_experts`. Override consumer alignment and device when required:
+Direct alignment is enabled only by each field schema. Replay adapters declare schemas for attention selection, valid counts, and R3 expert indices; the generic backend does not classify fields by name. Configure the contract and consumer device as follows:
 
 ```yaml
 transfer_backend:
   backend_name: Mooncake
   backend_config:
     direct_read_device: cuda
-    direct_read_fields:
-      attention_selection: 4096
-      attention_selection_valid_count: 4
-      routed_experts: 64
+    field_schemas:
+      attention_selection:
+        codec: torch_tensor
+        direct_alignment: 4096
+      attention_selection_valid_count:
+        codec: torch_tensor
+        direct_alignment: 4
+      routed_experts:
+        codec: torch_tensor
+        direct_alignment: 64
 ```
 
-These numbers constrain output allocation addresses. Model row padding remains part of the attention-selection profile. Interior scatter fragments need only their actual transport/dtype alignment, so short R3 rows can be selected without padding every row to 4 KiB. An explicit `direct_read_fields: {}` selects the compatibility path.
+The schema values constrain output allocation addresses and travel with the stored member and reference. Only sources actually used by the final row plan participate in contract validation; selected direct and ordinary rows of the same field cannot be combined implicitly. Model row padding remains part of the attention-selection profile. Interior scatter fragments need only their actual transport/dtype alignment, so short R3 rows can be selected without padding every row to 4 KiB. A field schema without `direct_alignment` selects the ordinary path. The removed `direct_read_fields` setting is rejected; declare requirements in `field_schemas` instead.
 
 This requires Mooncake's `tensor_destination` and native strict range-read support. Unsupported device/transport combinations fail instead of silently staging through CPU memory. The first implementation supports tested classic-TE GPU direct paths; TENT strict destinations are not enabled until physical-drain semantics are available. PUT `copy_mode` does not determine GET directness; ROLL's plain tensor PUT continues to use `copy` or `auto`, while Mooncake's strict zero-copy PUT requires registered tensor-object sources.
 
