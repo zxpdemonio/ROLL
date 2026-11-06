@@ -10,10 +10,7 @@ import ray
 import torch
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
-if sys.version_info < (3, 13):
-    import transfer_queue as tq
-else:
-    tq = None
+tq = None
 
 from omegaconf import OmegaConf
 from ray.exceptions import GetTimeoutError
@@ -36,11 +33,20 @@ _shared_storage = None
 
 
 def _check_transfer_queue_available():
-    if tq is None:
+    global tq
+    if sys.version_info >= (3, 13):
         raise ImportError(
             "TransferQueue is not available on Python 3.13+. "
             "Please use an alternative transfer backend or downgrade to Python <= 3.12."
         )
+    if tq is None:
+        try:
+            import transfer_queue
+        except ModuleNotFoundError as exc:
+            if exc.name != "transfer_queue":
+                raise
+            raise ImportError("The TransferQueue backend requires the transfer_queue package.") from exc
+        tq = transfer_queue
 
 
 def _check_mooncake_available():
@@ -660,6 +666,7 @@ class MooncakeClient:
 
 
 def init_transfer_queue_server(config):
+    _check_transfer_queue_available()
     # Must create enough storage units or may encounter:
     # EncodeError: Can't encode Ext objects with data longer than 2**32 - 1.
     # But also cannot set too many storage units that exceed the number of cores of ray cluster.
