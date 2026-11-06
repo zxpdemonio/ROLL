@@ -1,6 +1,7 @@
 import dataclasses
 import os
 import sys
+from collections.abc import MutableMapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Dict, Literal, Optional, Union, List
@@ -749,7 +750,11 @@ class PPOConfig(BaseConfig):
             backend_config = self.transfer_backend.backend_config
             if backend_config is None:
                 backend_config = self.transfer_backend.backend_config = {}
-            schemas = backend_config.setdefault("field_schemas", {})
+            schemas = backend_config.get("field_schemas")
+            if schemas is None:
+                schemas = backend_config["field_schemas"] = {}
+            if not isinstance(schemas, MutableMapping):
+                raise TypeError("field_schemas must be a mutable mapping or None")
             if profile is not None:
                 schemas.setdefault(
                     "attention_selection",

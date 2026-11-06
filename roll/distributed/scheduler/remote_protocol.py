@@ -969,6 +969,7 @@ class ColumnRemoteBatch(RemoteBatch):
         or a list of ColumnRemoteBatch for concatenated fields.
         """
         super().__init__("column", partition, device)
+        self.device = device
         self._structure_lock = threading.RLock()
         self.fields = fields
         self.cache = cache
@@ -1053,9 +1054,7 @@ class ColumnRemoteBatch(RemoteBatch):
         self._ensure_active()
         super().to(device)
         if self.cache is not None:
-            target = torch.device(device)
-            if target.type == "cuda" and target.index is None:
-                target = torch.device("cuda", torch.cuda.current_device())
+            target = self._resolve_device(device)
             direct = [
                 key
                 for key in self.cache.keys()
@@ -1073,13 +1072,24 @@ class ColumnRemoteBatch(RemoteBatch):
         return self
 
     def _is_direct_field(self, field: str) -> bool:
-        return any(self._direct_schema_signature(field))
-
-    def _direct_schema_signature(self, field: str) -> tuple[bool, ...]:
         source = self.fields[field]
         if isinstance(source, list):
-            return tuple(flag for chunk in source for flag in chunk._direct_schema_signature(field))
-        return (transfer_backend.requires_direct(source),)
+            return any(chunk._is_direct_field(field) for chunk in source)
+        return transfer_backend.requires_direct(source)
+
+    @staticmethod
+    def _resolve_device(device):
+        target = torch.device(device)
+        if target.type == "cuda" and target.index is None:
+            return torch.device("cuda", torch.cuda.current_device())
+        return torch.device("cpu") if target.type == "cpu" else target
+
+    def _direct_source_signature(self, field: str) -> tuple:
+        pipeline = tuple(id(operator) for operator in self._field_pipelines[field])
+        source = self.fields[field]
+        if isinstance(source, list):
+            return pipeline, tuple(chunk._direct_source_signature(field) for chunk in source)
+        return pipeline, transfer_backend.requires_direct(source)
 
     def _transform_cache(self):
         if self.cache is None:
@@ -1104,6 +1114,7 @@ class ColumnRemoteBatch(RemoteBatch):
                     "row": torch.arange(size),
                 },
                 batch_size=[size],
+                device="cpu",
             )
         for operator in self._field_pipelines[fields[0]]:
             data = operator.execute(data)
@@ -1144,11 +1155,8 @@ class ColumnRemoteBatch(RemoteBatch):
         groups: dict[tuple, list[str]] = {}
         for field in missing_fields:
             source = self.fields[field]
-            pipeline = self._field_pipelines[field]
             source_key = ("nested", id(source)) if isinstance(source, list) else ("direct",)
-            groups.setdefault(
-                source_key + tuple(id(op) for op in pipeline) + (self._direct_schema_signature(field),), []
-            ).append(field)
+            groups.setdefault(source_key + (self._direct_source_signature(field),), []).append(field)
 
         for group_fields in groups.values():
             source = self.fields[group_fields[0]]
@@ -1309,7 +1317,14 @@ class ColumnRemoteBatch(RemoteBatch):
             if self._row_ids is not None:
                 assert self._row_ids == rhs._row_ids, "Row ids must have the same order"
             adopted_fields = {field: value for field, value in rhs.fields.items() if field not in self.fields}
-            adopted_cache_keys = [field for field in adopted_fields if rhs.cache is not None and field in rhs.cache]
+            target = self._resolve_device(self.device) if self.device is not None else None
+            adopted_cache_keys = [
+                field
+                for field in adopted_fields
+                if rhs.cache is not None
+                and field in rhs.cache
+                and (target is None or not rhs._is_direct_field(field) or rhs.cache[field].device == target)
+            ]
             if adopted_cache_keys:
                 adopted_cache = rhs.cache.select(*adopted_cache_keys).clone(recurse=False)
                 if self.cache is None:

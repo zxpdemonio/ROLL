@@ -296,3 +296,84 @@ def test_fields_are_grouped_by_their_own_source_schemas(monkeypatch):
     assert result["a"].item() == 1
     assert result["b"].item() == 2
     assert sorted(calls) == ["direct", "plain"]
+
+
+def _boundary_batch(key="x", ref=1, row_ids=None):
+    return ColumnRemoteBatch(
+        partition="boundary",
+        device=None,
+        fields={key: descriptor(ref, (3, 1))},
+        cache=None,
+        batch_size=3,
+        row_ids=row_ids,
+    )
+
+
+def _install_boundary_reader(monkeypatch, calls):
+    def direct(partition, keys, sources, rows, **kwargs):
+        calls.append(kwargs)
+        return transfer_backend.create_tensordict(
+            {
+                key: torch.tensor(
+                    [sources[source][key]["ref"] * 10 + row for source, row in rows], dtype=torch.int32
+                ).view(-1, 1)
+                for key in keys
+            }
+        )
+
+    monkeypatch.setattr(transfer_backend, "get_direct", direct)
+
+
+def test_nested_cat_uses_each_fields_child_row_plan(monkeypatch):
+    x = _boundary_batch("x", 1, ["a", "b", "c"]).select_idxs([2, 0])
+    y = _boundary_batch("y", 2, ["c", "b", "a"]).select_idxs([0, 2])
+    x.union(y)
+    _install_boundary_reader(monkeypatch, [])
+    result = ColumnRemoteBatch._cat([x, x]).materialize()
+    assert result["x"].flatten().tolist() == [12, 10, 12, 10]
+    assert result["y"].flatten().tolist() == [20, 22, 20, 22]
+
+
+@pytest.mark.parametrize("operation", ["slice", "rows", "fields", "clone", "pickle", "cat"])
+def test_consumer_device_survives_remote_view_reconstruction(monkeypatch, operation):
+    import pickle
+
+    batch = _boundary_batch().to("cpu")
+    views = {
+        "slice": lambda: batch.slice(1, 3),
+        "rows": lambda: batch.select_idxs([2, 0]),
+        "fields": lambda: batch.select(["x"]),
+        "clone": batch.clone,
+        "pickle": lambda: pickle.loads(pickle.dumps(batch)),
+        "cat": lambda: ColumnRemoteBatch._cat([batch, batch]),
+    }
+    calls = []
+    _install_boundary_reader(monkeypatch, calls)
+    view = views[operation]()
+    view.materialize()
+    assert calls[0]["device"] == "cpu"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for GPU index metadata")
+@pytest.mark.parametrize("boolean", [False, True])
+def test_direct_row_plan_accepts_cuda_indices(monkeypatch, boolean):
+    calls = []
+    _install_boundary_reader(monkeypatch, calls)
+    index = torch.tensor([True, False, True] if boolean else [2, 0], device="cuda")
+    result = _boundary_batch().select_idxs(index).materialize()["x"]
+    assert result.flatten().tolist() == ([10, 12] if boolean else [12, 10])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for a mismatched direct cache")
+def test_union_rematerializes_direct_cache_on_consumer_device(monkeypatch):
+    left = _boundary_batch("plain").to("cpu")
+    left.fields["plain"].pop("schema")
+    right = _boundary_batch().to("cuda")
+    right.cache = transfer_backend.create_tensordict({"x": torch.zeros(3, 1, device="cuda")})
+    calls = []
+    _install_boundary_reader(monkeypatch, calls)
+    left.union(right)
+    assert left.cache is None or "x" not in left.cache
+    result = left.materialize(["x"])
+    assert result["x"].device.type == "cpu"
+    assert calls[0]["device"] == "cpu"

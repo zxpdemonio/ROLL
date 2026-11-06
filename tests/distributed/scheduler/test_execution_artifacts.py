@@ -445,7 +445,7 @@ def test_hold_aside_actor_replay_artifacts_ignores_realign_key_when_empty():
     torch.testing.assert_close(batch.batch["tokens"], torch.tensor([[10]]))
 
 
-@pytest.mark.parametrize("compatibility", [False, True])
+@pytest.mark.parametrize("compatibility", [False, True, None])
 def test_mooncake_replay_defaults_to_consumer_direct_reads(profile, compatibility):
     settings = (
         {
@@ -457,6 +457,8 @@ def test_mooncake_replay_defaults_to_consumer_direct_reads(profile, compatibilit
         if compatibility
         else {}
     )
+    if compatibility is None:
+        settings = {"field_schemas": None}
     config = PPOConfig(
         sequence_length=5,
         rollout_batch_size=2,
@@ -476,3 +478,15 @@ def test_mooncake_replay_defaults_to_consumer_direct_reads(profile, compatibilit
     )
     assert schemas["attention_selection_valid_count"].get("direct_alignment") == (None if compatibility else 4)
     assert config.transfer_backend.backend_config["direct_read_device"] == "cuda"
+
+
+@pytest.mark.parametrize("schemas", [[], "tensor"])
+def test_replay_config_rejects_non_mapping_schema_container(schemas):
+    with pytest.raises(TypeError, match="field_schemas must be a mutable mapping"):
+        PPOConfig(
+            sequence_length=5,
+            rollout_batch_size=2,
+            transfer_backend=TransferBackendArguments(
+                backend_name="Mooncake", backend_config={"field_schemas": schemas}
+            ),
+        )
