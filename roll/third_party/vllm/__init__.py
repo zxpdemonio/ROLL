@@ -5,6 +5,7 @@ from typing import Dict, List
 import dataclasses
 import torch
 import vllm
+import transformers
 from packaging.version import Version
 from vllm import envs
 from vllm.engine.arg_utils import AsyncEngineArgs
@@ -32,7 +33,8 @@ if vllm_version.release[:2] == (0, 17):
 if Version("0.11.0") <= vllm_version < Version("0.11.1"):
     legacy_ray_executor_package = "roll.third_party.vllm.vllm_0_11_0"
 elif Version("0.15") <= vllm_version:
-    if Version("0.16").release <= vllm_version.release:
+    if Version("0.16").release <= vllm_version.release and Version(transformers.__version__).major < 5:
+        # Only adapt the vLLM backport configs for Transformers4.
         import roll.third_party.vllm.patch_transformers # apply patch
 elif vllm_version < Version("0.11.0"):
     logger.warning(f"ROLL does not support vLLM version {vllm.__version__}.")
