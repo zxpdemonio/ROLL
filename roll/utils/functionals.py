@@ -1826,7 +1826,7 @@ def postprocess_generate(
     expert_dtype = None
     if routed_experts is not None:
         _, layer_num, topk = routed_experts[0].size()
-        from roll.third_party.megatron.router_replay_utils import get_expert_dtype
+        from roll.utils.execution_artifacts import get_expert_dtype
         if num_moe_experts is not None:
             expert_dtype = get_expert_dtype(num_moe_experts)
         else:
@@ -1870,7 +1870,7 @@ def postprocess_generate(
             # collapsing routing_map and breaking the dropless AllToAll dispatcher due to size mismatch. Fill padding
             # rows with distinct expert indices to keep routing_map dense. This is safe since padding is masked from loss.
             if valid_length - 1 < sequence_length:
-                new_routed_experts[i, valid_length - 1 :] = torch.arange(topk, dtype=expert_dtype).view(1, 1, topk)
+                new_routed_experts[i, valid_length - 1 :] = torch.arange(topk).to(expert_dtype).view(1, 1, topk)
         if attention_selection is not None:
             attention_valid_counts.append(valid_length - 1)
         if position_ids.dim() == 3 and shift > 0:

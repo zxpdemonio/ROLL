@@ -22,22 +22,9 @@ from megatron.core.transformer.moe.router_replay import (
 )
 
 from roll.utils.logging import get_logger
+from roll.utils.execution_artifacts import get_expert_dtype
 
 logger = get_logger()
-
-
-def get_expert_dtype(num_moe_experts: int) -> torch.dtype:
-    """Statically select minimal dtype for expert indices based on model config.
-
-    Uses tf_config.num_moe_experts (unified Megatron field) to determine the
-    minimal dtype without a runtime .max().item() GPU sync. This is safe because
-    router top-k indices are always in [0, num_moe_experts - 1].
-    """
-    if num_moe_experts <= 256:
-        return torch.uint8
-    elif num_moe_experts <= 65536:
-        return torch.uint16
-    return torch.uint32
 
 
 def get_device_name() -> str:

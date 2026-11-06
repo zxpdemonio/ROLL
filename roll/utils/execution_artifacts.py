@@ -19,6 +19,15 @@ ACTOR_REPLAY_ARTIFACT_KEYS = (
 )
 
 
+def get_expert_dtype(num_moe_experts: int) -> torch.dtype:
+    """Choose expert-index storage from the model's static expert count."""
+    if num_moe_experts <= 256:
+        return torch.uint8
+    if num_moe_experts <= 65536:
+        return torch.uint16
+    return torch.uint32
+
+
 @dataclass(frozen=True)
 class AttentionSelectionProfile:
     """Job-level description of one sparse-attention selection layout.
