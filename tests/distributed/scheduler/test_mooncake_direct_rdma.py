@@ -1,6 +1,7 @@
 """Consumer-process direct reads against an explicitly configured RDMA store."""
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -33,8 +34,11 @@ def test_replay_columns_read_without_actor_payload(monkeypatch, mode, device):
         "direct_read_device": device,
     }
     writer = transfer_backend.MooncakeClient(config)
-    # No actor can return a tensor: every direct read must stay in this process.
-    monkeypatch.setattr(transfer_backend.MooncakeNodeClientProxy, "_get_node_actor", lambda self: None)
+    # Only initialization acknowledgement may cross the actor boundary.
+    # Payload methods are absent: every direct read must stay in this process.
+    ready = SimpleNamespace(ready=SimpleNamespace(remote=lambda: None))
+    monkeypatch.setattr(transfer_backend.MooncakeNodeClientProxy, "_get_node_actor", lambda self: ready)
+    monkeypatch.setattr(transfer_backend.ray, "get", lambda value: value)
     proxy = transfer_backend.MooncakeNodeClientProxy(config)
     monkeypatch.setattr(transfer_backend, "_client", proxy)
     monkeypatch.setattr(transfer_backend, "get", lambda *a, **kw: pytest.fail("actor payload path used"))

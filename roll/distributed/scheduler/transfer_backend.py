@@ -312,6 +312,10 @@ class MooncakeNodeTransferActor:
     def __init__(self, config: dict[str, Any] | None = None):
         self.client = MooncakeClient(config)
 
+    def ready(self):
+        """Acknowledge that this node's storage segment is available."""
+        return None
+
     def put(
         self,
         partition,
@@ -359,7 +363,14 @@ class MooncakeNodeClientProxy:
         fields: dict[str, torch.Tensor | np.ndarray],
         batch_size: int,
     ):
-        remote = ray.get(self.actor.put.remote(partition, row_ids, fields, batch_size))
+        schemas = self.config.get("field_schemas") or {}
+        if any(schemas.get(key, {}).get("direct_alignment") is not None for key in fields):
+            # Keep one bundle/transaction for mixed batches. Only metadata
+            # crosses Ray; the node actor still owns the donated segment.
+            with self._direct_lock:
+                remote = self._get_direct_client_locked().put(partition, row_ids, fields, batch_size)
+        else:
+            remote = ray.get(self.actor.put.remote(partition, row_ids, fields, batch_size))
         cached = {key: value for key, value in fields.items() if not requires_direct(remote.fields[key])}
         remote.cache = create_tensordict(cached) if cached else None
         return remote
@@ -385,11 +396,7 @@ class MooncakeNodeClientProxy:
     def _get_direct_locked(self, partition, keys, sources, row_plan, device):
         from roll.distributed.scheduler.mooncake_direct import read_direct_columns
 
-        if self._direct_client is None:
-            config = dict(self.config)
-            config["global_segment_size"] = 0
-            self._direct_client = MooncakeClient(config)
-        backend = self._direct_client.backend
+        backend = self._get_direct_client_locked().backend
         pending, backend._roll_pending_direct_registrations = backend._roll_pending_direct_registrations, []
         for target in pending:
             try:
@@ -409,6 +416,30 @@ class MooncakeNodeClientProxy:
                 device=device if device is not None else self.config.get("direct_read_device", "cuda"),
             )
         )
+
+    def _get_direct_client_locked(self):
+        if self._direct_client is None:
+            # Actor construction is asynchronous. Wait before the first PUT so
+            # the client-only process never races the node's segment setup.
+            ray.get(self.actor.ready.remote())
+            config = dict(self.config)
+            config["global_segment_size"] = 0
+            if config.get("setup_args") is not None:
+                args = list(config["setup_args"])
+                if len(args) == 1 and isinstance(args[0], Mapping):
+                    args[0] = {**args[0], "global_segment_size": 0}
+                else:
+                    args[2] = 0
+                config["setup_args"] = args
+            elif config.get("setup_kwargs") is not None:
+                kwargs = dict(config["setup_kwargs"])
+                if "config" in kwargs:
+                    kwargs["config"] = {**kwargs["config"], "global_segment_size": 0}
+                else:
+                    kwargs["global_segment_size"] = 0
+                config["setup_kwargs"] = kwargs
+            self._direct_client = MooncakeClient(config)
+        return self._direct_client
 
     def delete(self, partition, keys: list[str], fields: list[Any]):
         return ray.get(self.actor.delete.remote(partition, keys, fields))

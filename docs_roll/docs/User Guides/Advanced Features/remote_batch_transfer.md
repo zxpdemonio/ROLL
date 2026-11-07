@@ -129,7 +129,7 @@ Mooncake-specific `backend_config` options are:
 
 | Option | Description |
 | --- | --- |
-| `client_scope` | `node` reuses one Mooncake client and BufferPool per Ray node. It is the only supported scope. |
+| `client_scope` | `node` keeps storage-segment ownership and ordinary GET buffers in one node actor. Schema-selected PUT/direct GET reuse a process-local client with no donated global segment. It is the only supported scope. |
 | `key_prefix` | Prefix used for Mooncake Store keys. The default is `roll`. |
 | `transfer_policy` | Optional arguments for Mooncake `BundleTransferPolicy`, such as `copy_mode`, `put_mode`, and `max_inflight_put`. |
 | `field_schemas` | Optional per-field `codec`, `nullable`, and `metadata` settings. Unknown schema options fail during client initialization. |
@@ -179,6 +179,10 @@ Local aliases share cleanup state, but ROLL does not provide a cross-process ref
 #### 5. Direct GPU reads for replay fields
 
 Mooncake replay jobs read selection indices in the consuming training process. Ray carries references and row metadata; direct payloads do not return through the node actor's GET or Ray object store. The consumer allocates and registers the output tensor, and Mooncake writes selected rows directly into it. Slice, select, repeat, and concatenation use the existing row plan before materialization.
+
+If an uploaded batch contains a field whose schema declares `direct_alignment`, the producing process also writes through that process-local Mooncake client. It waits for the node actor's storage segment to be ready, then publishes the whole mixed batch as one structured DataProto object. This avoids sending large tensors through Ray and avoids cross-version PyTorch tensor-pickle compatibility requirements on this PUT boundary. The local client sets `global_segment_size=0`, including when Store setup uses positional or dictionary arguments; the node actor retains storage ownership and cleanup. Its process-local transport buffers still require memory budgeting.
+
+Batches without a selected direct field keep the actor PUT path. Ordinary fields in a mixed batch keep their ordinary GET contract. This selection uses the schema, not field names or tensor dtype. Producer-side `copy/auto` behavior and vLLM's capture-to-CPU export are separate: process-local PUT does not imply GPU-to-GPU delivery or eliminate vLLM's existing host snapshot.
 
 Direct alignment is enabled only by each field schema. Replay adapters declare schemas for attention selection, valid counts, and R3 expert indices; the generic backend does not classify fields by name. Configure the contract and consumer device as follows:
 
