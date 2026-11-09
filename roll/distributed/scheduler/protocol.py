@@ -1309,6 +1309,14 @@ class DataProto:
 
             if data._remote_batch is not None:
                 try:
+                    # Appended columns inherit the existing consumer placement.
+                    # A producer's CPU fields must not pin device-default refs
+                    # to CPU, or replace an explicit consumer .to(device).
+                    consumer_device = data._remote_batch.device
+                    if consumer_device is None:
+                        remote_batch.device = None
+                    else:
+                        remote_batch = remote_batch.to(consumer_device)
                     remote_batch = remote_batch.union(data._remote_batch)
                 except Exception:
                     try:

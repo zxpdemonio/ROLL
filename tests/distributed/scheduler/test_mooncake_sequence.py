@@ -205,7 +205,8 @@ def test_resume_keeps_original_prefix_choices_and_only_appends_new_tail():
     assert [(part[0], part[2], part[3]) for part in merged.parts] == [(previous, 0, 2), (current, 2, 4)]
 
 
-def test_dataproto_packs_refs_without_get_or_second_payload_put(monkeypatch):
+@pytest.mark.parametrize("consumer_device", [None, "cpu", "cuda:1"])
+def test_dataproto_packs_refs_without_get_or_second_payload_put(monkeypatch, consumer_device):
     from tensordict import TensorDict
 
     from roll.distributed.scheduler.protocol import DataProto
@@ -227,6 +228,8 @@ def test_dataproto_packs_refs_without_get_or_second_payload_put(monkeypatch):
     )
     assert "routed_experts" not in packed._batch
     assert packed._remote_batch.cache is None
+    if consumer_device is not None:
+        packed._remote_batch.to(consumer_device)
     actual = []
 
     def put(partition, row_ids, fields, batch_size):
@@ -234,9 +237,9 @@ def test_dataproto_packs_refs_without_get_or_second_payload_put(monkeypatch):
         actual.extend(fields)
         return ColumnRemoteBatch(
             partition,
-            None,
+            torch.device("cpu"),
             {key: {"ref": "tokens", "kind": "batch"} for key in fields},
-            cache=None,
+            cache=tb.create_tensordict(fields) if consumer_device != "cuda:1" else None,
             batch_size=batch_size,
             row_ids=row_ids,
         )
@@ -246,6 +249,10 @@ def test_dataproto_packs_refs_without_get_or_second_payload_put(monkeypatch):
     assert "routed_experts" in remote._remote_batch.fields
     assert "input_ids" in actual
     assert len(remote._remote_batch._states) == 2
+    if consumer_device is None:
+        assert remote._remote_batch.device is None
+    else:
+        assert torch.device(remote._remote_batch.device) == torch.device(consumer_device)
 
 
 @pytest.mark.parametrize("change", ["length", "width", "dtype", "schema"])
