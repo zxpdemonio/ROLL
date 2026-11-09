@@ -1,5 +1,5 @@
-import sys
 import os
+import sys
 import threading
 import uuid
 from collections.abc import Mapping
@@ -8,12 +8,9 @@ from typing import Any
 import numpy as np
 import ray
 import torch
-from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
-
-tq = None
-
 from omegaconf import OmegaConf
 from ray.exceptions import GetTimeoutError
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from tensordict import NonTensorStack, TensorDict
 from tensordict.utils import LinkedList
 
@@ -23,6 +20,8 @@ from roll.utils.constants import RAY_NAMESPACE, STORAGE_NAME
 from roll.utils.logging import get_logger
 
 logger = get_logger()
+
+tq = None
 
 MOONCAKE_CLIENT_SCOPE_NODE = "node"
 MOONCAKE_NODE_ACTOR_NAME_PREFIX = "MooncakeNodeTransfer"
@@ -396,17 +395,9 @@ class MooncakeNodeClientProxy:
     def _get_direct_locked(self, partition, keys, sources, row_plan, device):
         from roll.distributed.scheduler.mooncake_direct import read_direct_columns
 
-        backend = self._get_direct_client_locked().backend
-        pending, backend._roll_pending_direct_registrations = backend._roll_pending_direct_registrations, []
-        for target in pending:
-            try:
-                status = backend.store.unregister_buffer(target.data_ptr())
-                if status != 0:
-                    raise RuntimeError(f"Mooncake pending deregistration failed: {status}")
-            except Exception:
-                backend._roll_pending_direct_registrations.append(target)
-        if backend._roll_pending_direct_registrations:
-            raise RuntimeError("Mooncake has pending direct destination deregistrations")
+        client = self._get_direct_client_locked()
+        client._retry_pending_put_cleanups()
+        backend = client.backend
         return create_tensordict(
             read_direct_columns(
                 backend,
@@ -442,6 +433,20 @@ class MooncakeNodeClientProxy:
         return self._direct_client
 
     def delete(self, partition, keys: list[str], fields: list[Any]):
+        from roll.distributed.scheduler.mooncake_direct import (
+            retry_direct_registrations,
+        )
+
+        with self._direct_lock:
+            if self._direct_client is not None:
+                try:
+                    self._direct_client._retry_pending_put_cleanups()
+                except Exception:
+                    logger.warning("Pending Mooncake PUT cleanup failed; continuing object cleanup", exc_info=True)
+                try:
+                    retry_direct_registrations(self._direct_client.backend)
+                except Exception:
+                    logger.warning("Pending Mooncake deregistration failed; continuing object cleanup", exc_info=True)
         return ray.get(self.actor.delete.remote(partition, keys, fields))
 
     def _get_node_actor(self):
@@ -480,6 +485,7 @@ class MooncakeClient:
 
         self.backend = MooncakeBundleTransfer(store, key_prefix=config.get("key_prefix", "roll"))
         self.backend._roll_pending_direct_registrations = []
+        self._pending_put_cleanup_refs = []
         policy_config = config.get("transfer_policy")
         self.transfer_policy = BundleTransferPolicy(**policy_config) if policy_config else None
         self.field_schemas = self._build_field_schemas(config.get("field_schemas"), FieldSchema)
@@ -493,6 +499,7 @@ class MooncakeClient:
         batch_size: int,
     ):
         self._retry_pending_release_results()
+        self._retry_pending_put_cleanups()
         from roll.distributed.scheduler.remote_protocol import ColumnRemoteBatch
 
         batch_fields, non_tensor_fields = self._split_fields(fields)
@@ -510,7 +517,39 @@ class MooncakeClient:
         put_kwargs = {"type": "dataproto", "partition": partition, "policy": self.transfer_policy}
         if self.field_schemas:
             put_kwargs["field_schemas"] = self.field_schemas
-        ref = self.backend.put(data, **put_kwargs)
+        from roll.distributed.scheduler.mooncake_direct import (
+            add_cleanup_note,
+            registered_direct_tensors,
+        )
+
+        ref = None
+        try:
+            with registered_direct_tensors(self.backend) as register:
+                mode = getattr(self.transfer_policy, "copy_mode", "auto")
+                for key, tensor in list(batch_fields.items()):
+                    schema = self.field_schemas.get(key)
+                    if (
+                        mode == "auto"
+                        and tensor.is_cuda
+                        and schema is not None
+                        and schema.direct_alignment is not None
+                    ):
+                        # A private GPU snapshot also survives caller resize/set_
+                        # after an error with pending deregistration. No D2H.
+                        source = tensor.detach().clone(memory_format=torch.contiguous_format)
+                        register(source)
+                        batch_fields[key] = source
+                ref = self.backend.put(data, **put_kwargs)
+        except BaseException as exc:
+            # PUT may have succeeded before deregistration failed. Do not
+            # discard the only reference to the newly published object.
+            if ref is not None:
+                try:
+                    self.backend.cleanup_dataproto(ref)
+                except Exception as cleanup_error:
+                    self._pending_put_cleanup_refs.append(ref)
+                    add_cleanup_note(exc, cleanup_error)
+            raise
         field_refs = {
             key: {"ref": ref, "kind": "batch" if key in batch_fields else "non_tensor"} for key in fields.keys()
         }
@@ -535,6 +574,7 @@ class MooncakeClient:
 
     def get(self, partition, keys: list[str], fields: list[Any]):
         self._retry_pending_release_results()
+        self._retry_pending_put_cleanups()
         if not fields:
             return TensorDict({}, batch_size=[0])
 
@@ -582,6 +622,19 @@ class MooncakeClient:
             delattr(data, _MOONCAKE_RELEASE_RESULTS_ATTR)
         self._retry_pending_release_results()
 
+    def _retry_pending_put_cleanups(self):
+        pending = getattr(self, "_pending_put_cleanup_refs", [])
+        self._pending_put_cleanup_refs = []
+        first_error = None
+        for ref in pending:
+            try:
+                self.backend.cleanup_dataproto(ref)
+            except Exception as exc:
+                self._pending_put_cleanup_refs.append(ref)
+                first_error = first_error or exc
+        if first_error is not None:
+            raise RuntimeError("Mooncake has pending PUT cleanups") from first_error
+
     def delete(self, partition, keys: list[str], fields: list[Any]):
         refs = []
         seen = set()
@@ -597,6 +650,7 @@ class MooncakeClient:
 
         try:
             self._retry_pending_release_results()
+            self._retry_pending_put_cleanups()
         except Exception:
             logger.warning("Pending Mooncake GET release still failed; continuing object cleanup", exc_info=True)
 

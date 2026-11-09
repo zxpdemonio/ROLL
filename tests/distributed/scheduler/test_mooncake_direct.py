@@ -5,7 +5,11 @@ import pytest
 import torch
 
 from roll.distributed.scheduler import transfer_backend
-from roll.distributed.scheduler.mooncake_direct import read_direct_columns
+from roll.distributed.scheduler.mooncake_direct import (
+    read_direct_columns,
+    registered_direct_tensors,
+    retry_direct_registrations,
+)
 from roll.distributed.scheduler.remote_protocol import ColumnRemoteBatch
 
 
@@ -100,7 +104,147 @@ def test_direct_columns_retain_failed_deregistrations(tensor_destination_stub):
             device="cpu",
         )
     assert len(backend._roll_pending_direct_registrations) == 1
-    assert backend._roll_pending_direct_registrations[0].data_ptr() in backend.registered
+    assert backend._roll_pending_direct_registrations[0].pointer in backend.registered
+
+
+def test_pending_cleanup_uses_the_address_snapshot():
+    backend = FakeDirectBackend()
+    source = torch.empty(16)
+    pointer = source.data_ptr()
+    backend.fail_unregister = True
+    with pytest.raises(RuntimeError, match="deregistration"):
+        with registered_direct_tensors(backend) as register:
+            register(source)
+    # Cleanup must use the captured address rather than mutable Tensor metadata.
+    source.set_(torch.empty(32))
+    assert source.data_ptr() != pointer
+    backend.fail_unregister = False
+    retry_direct_registrations(backend)
+    assert not backend.registered
+    assert not backend._roll_pending_direct_registrations
+
+
+def test_failed_source_registration_does_not_release_an_existing_owner():
+    backend = FakeDirectBackend()
+    source = torch.empty(16)
+    backend.registered.add(source.data_ptr())
+    backend.register_buffer = lambda *_: -1
+    with pytest.raises(RuntimeError, match="registration failed"):
+        with registered_direct_tensors(backend) as register:
+            register(source)
+    assert backend.registered == {source.data_ptr()}
+    assert not backend._roll_pending_direct_registrations
+
+
+class CpuDeviceSource(torch.Tensor):
+    """CPU-backed source for testing the producer registration protocol."""
+
+    @property
+    def is_cuda(self):
+        return True
+
+
+@pytest.mark.parametrize("mode", ["copy", "auto"])
+@pytest.mark.parametrize("direct", [False, True])
+@pytest.mark.parametrize("non_contiguous", [False, True])
+def test_producer_registers_only_schema_gpu_auto(mode, direct, non_contiguous):
+    backend = FakeDirectBackend()
+    client = object.__new__(transfer_backend.MooncakeClient)
+    client.backend = backend
+    client._pending_release_results = []
+    client.transfer_policy = SimpleNamespace(copy_mode=mode)
+    client.field_schemas = {"artifact": SimpleNamespace(codec="torch_tensor", direct_alignment=64 if direct else None)}
+    source = torch.arange(16, dtype=torch.int32).reshape(1, 4, 4).as_subclass(CpuDeviceSource)
+    if non_contiguous:
+        source = source.transpose(1, 2)
+    calls = []
+
+    def put(data, **kwargs):
+        actual = data["batch"]["artifact"]
+        if direct and mode == "auto":
+            assert actual.is_contiguous()
+            assert actual.data_ptr() in backend.registered
+            assert actual.data_ptr() != source.data_ptr()
+            assert actual.untyped_storage()._cdata != source.untyped_storage()._cdata
+        else:
+            assert actual is source
+            assert not backend.registered
+        calls.append(actual)
+        return object()
+
+    backend.put = put
+    fields = {"artifact": source}
+    client.put("test", ["r0"], fields, 1)
+    assert len(calls) == 1
+    assert fields["artifact"] is source
+    assert source.is_contiguous() != non_contiguous
+    assert not backend.registered
+
+
+def test_producer_cleans_published_ref_when_deregistration_fails():
+    backend = FakeDirectBackend()
+    backend.fail_unregister = True
+    client = object.__new__(transfer_backend.MooncakeClient)
+    client.backend = backend
+    client._pending_release_results = []
+    client.transfer_policy = None
+    client.field_schemas = {"artifact": SimpleNamespace(codec="torch_tensor", direct_alignment=64)}
+    ref = object()
+    backend.put = lambda *a, **kw: ref
+    cleaned = []
+    backend.cleanup_dataproto = cleaned.append
+    source = torch.empty(1, 4).as_subclass(CpuDeviceSource)
+    with pytest.raises(RuntimeError, match="deregistration"):
+        client.put("test", ["r0"], {"artifact": source}, 1)
+    assert cleaned == [ref]
+    pending = backend._roll_pending_direct_registrations[0]
+    pointer = pending.pointer
+    assert pointer != source.data_ptr()
+    source.set_(torch.empty(64))
+    source.resize_(128)
+    assert pending.tensor.data_ptr() == pointer
+    assert pending.size == pending.tensor.nbytes
+
+
+def test_producer_retains_failed_object_cleanup_for_retry():
+    backend = FakeDirectBackend()
+    backend.fail_unregister = True
+    client = object.__new__(transfer_backend.MooncakeClient)
+    client.backend = backend
+    client._pending_release_results = []
+    client.transfer_policy = None
+    client.field_schemas = {"artifact": SimpleNamespace(codec="torch_tensor", direct_alignment=64)}
+    ref = object()
+    backend.put = lambda *a, **kw: ref
+
+    def fail_cleanup(_):
+        raise RuntimeError("transient remove failure")
+
+    backend.cleanup_dataproto = fail_cleanup
+    with pytest.raises(RuntimeError, match="deregistration"):
+        client.put("test", ["r0"], {"artifact": torch.empty(1, 4).as_subclass(CpuDeviceSource)}, 1)
+    assert client._pending_put_cleanup_refs == [ref]
+    cleaned = []
+    backend.cleanup_dataproto = cleaned.append
+    client._retry_pending_put_cleanups()
+    assert cleaned == [ref]
+    assert client._pending_put_cleanup_refs == []
+    backend.fail_unregister = False
+    retry_direct_registrations(backend)
+    assert not backend.registered
+
+
+def test_cleanup_preserves_primary_exception_without_add_note():
+    class LegacyError(Exception):
+        add_note = None
+
+    backend = FakeDirectBackend()
+    backend.fail_unregister = True
+    with pytest.raises(LegacyError, match="primary failure"):
+        with registered_direct_tensors(backend) as register:
+            register(torch.empty(16))
+            raise LegacyError("primary failure")
+    assert backend._roll_pending_direct_registrations
 
 
 def test_direct_remote_batch_pushes_row_operations_to_metadata(monkeypatch):
@@ -377,3 +521,47 @@ def test_union_rematerializes_direct_cache_on_consumer_device(monkeypatch):
     result = left.materialize(["x"])
     assert result["x"].device.type == "cpu"
     assert calls[0]["device"] == "cpu"
+
+
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+def test_proxy_delete_retries_local_cleanup_without_skipping_actor(monkeypatch, cleanup_fails):
+    import threading
+
+    proxy = object.__new__(transfer_backend.MooncakeNodeClientProxy)
+    proxy._direct_lock = threading.Lock()
+    events = []
+
+    def retry():
+        events.append("retry")
+        if cleanup_fails:
+            raise RuntimeError("cleanup unavailable")
+
+    proxy._direct_client = SimpleNamespace(backend=FakeDirectBackend(), _retry_pending_put_cleanups=retry)
+
+    def delete(*_):
+        events.append("actor delete")
+        return "deleted"
+
+    proxy.actor = SimpleNamespace(delete=SimpleNamespace(remote=delete))
+    monkeypatch.setattr(transfer_backend.ray, "get", lambda value: value)
+    assert proxy.delete("p", [], []) == "deleted"
+    assert events == ["retry", "actor delete"]
+
+
+def test_proxy_direct_get_retries_local_put_cleanup(monkeypatch):
+    import roll.distributed.scheduler.mooncake_direct as direct_module
+
+    proxy = object.__new__(transfer_backend.MooncakeNodeClientProxy)
+    proxy.config = {}
+    events = []
+    proxy._direct_client = SimpleNamespace(
+        backend=object(), _retry_pending_put_cleanups=lambda: events.append("retry")
+    )
+
+    def read(*a, **kw):
+        events.append("read")
+        return {"value": torch.ones(1)}
+
+    monkeypatch.setattr(direct_module, "read_direct_columns", read)
+    proxy._get_direct_locked("p", [], [], [], "cpu")
+    assert events == ["retry", "read"]

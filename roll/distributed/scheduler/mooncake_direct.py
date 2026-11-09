@@ -1,8 +1,78 @@
 """Materialize Mooncake column rows into consumer-process tensor buffers."""
 
 import math
+from contextlib import contextmanager
+from typing import NamedTuple
 
 import torch
+
+
+class _Registration(NamedTuple):
+    pointer: int
+    size: int
+    tensor: torch.Tensor
+
+
+def add_cleanup_note(error, detail):
+    # Python 3.10 has no BaseException.add_note.
+    note = getattr(error, "add_note", None)
+    if callable(note):
+        note(str(detail))
+
+
+def retry_direct_registrations(backend):
+    pending = getattr(backend, "_roll_pending_direct_registrations", [])
+    backend._roll_pending_direct_registrations = []
+    for entry in pending:
+        try:
+            status = backend.store.unregister_buffer(entry.pointer)
+            if status != 0:
+                raise RuntimeError(f"Mooncake pending deregistration failed: {status}")
+        except Exception:
+            backend._roll_pending_direct_registrations.append(entry)
+    if backend._roll_pending_direct_registrations:
+        raise RuntimeError("Mooncake has pending direct buffer deregistrations")
+
+
+@contextmanager
+def registered_direct_tensors(backend):
+    """Own registrations through physically drained I/O, then retry failures.
+
+    Sources must not be modified/resized during I/O. Save the registered
+    address separately from mutable tensor metadata for cleanup and retry.
+    """
+    retry_direct_registrations(backend)
+    registrations = []
+    failure = None
+
+    def register(tensor):
+        entry = _Registration(tensor.data_ptr(), tensor.nbytes, tensor)
+        if not entry.size:
+            return
+        status = backend.store.register_buffer(entry.pointer, entry.size)
+        if status != 0:
+            raise RuntimeError(f"Mooncake direct buffer registration failed: {status}")
+        registrations.append(entry)
+
+    try:
+        yield register
+    except BaseException as exc:
+        failure = exc
+        raise
+    finally:
+        cleanup_error = None
+        for entry in reversed(registrations):
+            try:
+                status = backend.store.unregister_buffer(entry.pointer)
+                if status != 0:
+                    raise RuntimeError(f"Mooncake direct buffer deregistration failed: {status}")
+            except Exception as exc:
+                backend._roll_pending_direct_registrations.append(entry)
+                cleanup_error = cleanup_error or exc
+                if failure is not None:
+                    add_cleanup_note(failure, exc)
+        if failure is None and cleanup_error is not None:
+            raise cleanup_error
 
 
 def read_direct_columns(backend, keys, sources, row_plan, *, device):
@@ -16,9 +86,7 @@ def read_direct_columns(backend, keys, sources, row_plan, *, device):
     from mooncake.structured_object_store import tensor_destination
 
     output = {}
-    registrations = []
-    failure = None
-    try:
+    with registered_direct_tensors(backend) as register:
         for key in keys:
             used = {source for source, _ in row_plan}
             if not used:
@@ -55,10 +123,7 @@ def read_direct_columns(backend, keys, sources, row_plan, *, device):
             output[key] = target
             if not nbytes:
                 continue
-            status = backend.store.register_buffer(target.data_ptr(), nbytes)
-            if status != 0:
-                raise RuntimeError(f"Mooncake direct destination registration failed: {status}")
-            registrations.append(target)
+            register(target)
             start = 0
             while start < len(row_plan):
                 source_index = row_plan[start][0]
@@ -89,22 +154,4 @@ def read_direct_columns(backend, keys, sources, row_plan, *, device):
                 if result["batch"][key] is not destination:
                     raise RuntimeError("Mooncake direct read replaced the consumer destination")
                 start = stop
-    except BaseException as exc:
-        failure = exc
-        raise
-    finally:
-        cleanup_error = None
-        for target in reversed(registrations):
-            try:
-                status = backend.store.unregister_buffer(target.data_ptr())
-                if status != 0:
-                    raise RuntimeError(f"Mooncake direct destination deregistration failed: {status}")
-            except Exception as exc:
-                # Keep the registered allocation reachable for an explicit retry.
-                backend._roll_pending_direct_registrations.append(target)
-                cleanup_error = cleanup_error or exc
-                if failure is not None:
-                    failure.add_note(str(exc))
-        if failure is None and cleanup_error is not None:
-            raise cleanup_error
     return output
