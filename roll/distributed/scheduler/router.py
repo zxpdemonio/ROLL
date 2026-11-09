@@ -641,7 +641,24 @@ class RouterClient:
         return payload, request_id
 
     def _postprocess_generate(self, req, response):
-        output_data = DataProto(meta_info=req.meta_info)
+        from roll.distributed.scheduler.mooncake_direct import add_cleanup_note
+        from roll.distributed.scheduler.mooncake_sequence import AUX_OWNER_KEY
+
+        try:
+            return self._postprocess_generate_impl(req, response)
+        except BaseException as error:
+            owner = response.get(AUX_OWNER_KEY)
+            if owner is not None:
+                try:
+                    owner.drop()
+                except Exception as cleanup_error:
+                    add_cleanup_note(error, cleanup_error)
+            raise
+
+    def _postprocess_generate_impl(self, req, response):
+        from roll.distributed.scheduler.mooncake_sequence import AUX_OWNER_KEY
+
+        output_data = DataProto(meta_info=req.meta_info, remote_batch=response.get(AUX_OWNER_KEY))
         if self.strategy_name == "vllm_omni":
             required_output_keys = [
                 "responses",

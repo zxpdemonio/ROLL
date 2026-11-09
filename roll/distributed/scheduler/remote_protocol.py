@@ -1457,6 +1457,9 @@ class ColumnRemoteBatch(RemoteBatch):
         fields: dict[str, Any | list["ColumnRemoteBatch"]],
     ) -> list[_ColumnRemoteState]:
         direct_values = {id(value) for value in fields.values() if not isinstance(value, list)}
+        for value in fields.values():
+            if isinstance(value, dict) and value.get("kind") == "token_sequence":
+                direct_values.update(id(part["source"]) for sequence in value["sequences"] for part in sequence)
         states = [state for state in self._states if any(id(value) in direct_values for value in state.fields)]
         nested_fields = {}
         for field, value in fields.items():

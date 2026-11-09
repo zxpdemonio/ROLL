@@ -10,6 +10,7 @@ import vllm
 from packaging.version import Version
 
 from roll.platforms import current_platform
+from roll.third_party.vllm.aux_output_mooncake import install_aux_output_mooncake
 from roll.third_party.vllm.vllm_utils import TensorLoRARequest, patch_vllm_lora_manager
 from roll.utils.collective import collective
 from roll.utils.cuda_ipc_utils import MultiprocessingSerializer
@@ -22,6 +23,8 @@ from roll.utils.send_recv_utils import monkey_patch_torch_reductions, named_tens
 # since this module is imported when worker_extension_cls is loaded.
 from roll.third_party.vllm.gdn_patcher import patch_gdn_attention
 patch_gdn_attention()
+
+install_aux_output_mooncake()
 
 logger = get_logger()
 
@@ -59,6 +62,11 @@ class TensorLoraManager:
 
 
 class WorkerBase:
+    def settle_aux_outputs(self, **kwargs):
+        from roll.third_party.vllm.aux_output_mooncake import settle_worker_aux_outputs
+
+        return settle_worker_aux_outputs(self, **kwargs)
+
     def custom_init_worker(self, *args, **kwargs):
         self.weight_loaded: bool = True
         self.kv_cache_loaded: bool = True
@@ -97,6 +105,9 @@ class WorkerBase:
         assert (self.weight_loaded and self.kv_cache_loaded) or (not self.weight_loaded and not self.kv_cache_loaded)
         if not self.weight_loaded:
             return
+        from roll.third_party.vllm.aux_output_mooncake import drain_worker_aux_outputs
+
+        drain_worker_aux_outputs(self)
         self.sleep(level)
         self.weight_loaded = False
         self.kv_cache_loaded = False

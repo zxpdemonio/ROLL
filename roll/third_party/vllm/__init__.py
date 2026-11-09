@@ -64,6 +64,12 @@ except Exception:
 
 
 async def create_async_llm(resource_placement_groups: List[Dict], headless: bool = False, **kwargs):
+    mooncake_aux = kwargs.pop("roll_mooncake_aux_output", None)
+    if mooncake_aux is not None:
+        from roll.third_party.vllm.aux_output_mooncake import CONFIG_KEY, install_aux_output_mooncake
+
+        install_aux_output_mooncake(required=True)
+        kwargs["additional_config"] = {**(kwargs.get("additional_config") or {}), CONFIG_KEY: mooncake_aux}
     engine_arg_names = {field.name for field in dataclasses.fields(AsyncEngineArgs)}
     executor_backend = kwargs.get("distributed_executor_backend")
     if executor_backend == "ray" and vllm_version >= Version("0.11.1"):
@@ -216,6 +222,7 @@ async def create_async_llm(resource_placement_groups: List[Dict], headless: bool
         )
 
     await async_llm.custom_init_worker()
+    async_llm._roll_mooncake_aux_enabled = mooncake_aux is not None
 
     return async_llm
 

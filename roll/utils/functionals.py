@@ -1770,6 +1770,26 @@ def postprocess_generate(
     pad_to_seq_len=True,
 ) -> "DataProto":
     from roll.distributed.scheduler.protocol import DataProto
+    from roll.distributed.scheduler.mooncake_sequence import MooncakeRows, sequence_remote_batch
+
+    remote = {key: values for key, values in (("routed_experts", routed_experts),
+                                              (ATTENTION_SELECTION_KEY, attention_selection))
+              if values and isinstance(values[0], MooncakeRows)}
+    if remote:
+        result = postprocess_generate(
+            prompts, output, num_return_sequences, sequence_length, eos_token_id, pad_token_id,
+            fill_eos_token=fill_eos_token, output_logprobs=output_logprobs,
+            routed_experts=None if "routed_experts" in remote else routed_experts,
+            attention_selection=None if ATTENTION_SELECTION_KEY in remote else attention_selection,
+            attention_selection_profile=attention_selection_profile, num_moe_experts=num_moe_experts,
+            pad_to_seq_len=pad_to_seq_len,
+        )
+        valid_counts = [int(count) - 1 for count in result.batch["attention_mask"].sum(dim=-1).tolist()]
+        result._remote_batch = sequence_remote_batch(remote, valid_counts, result.batch["input_ids"].shape[1],
+                                                    attention_selection_profile)
+        if ATTENTION_SELECTION_KEY in remote:
+            result.batch[ATTENTION_SELECTION_VALID_COUNT_KEY] = torch.tensor(valid_counts, dtype=torch.int32)
+        return result
 
     if fill_eos_token:
         # yali: 如果output最后一个token不是pad_token_id，则替换成eos_token_id,

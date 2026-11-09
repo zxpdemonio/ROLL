@@ -124,6 +124,26 @@ def read_direct_columns(backend, keys, sources, row_plan, *, device):
             if not nbytes:
                 continue
             register(target)
+            if any(sources[index][key].get("kind") == "token_sequence" for index in used):
+                from roll.distributed.scheduler.mooncake_sequence import read_sequence_rows
+
+                for output_row, (source_index, source_row) in enumerate(row_plan):
+                    field = sources[source_index][key]
+                    if field["shape"][1:] != spec["shape"][1:] or field["dtype"] != spec["dtype"]:
+                        raise ValueError("Mooncake token-sequence layouts differ")
+                    if field.get("kind") == "token_sequence":
+                        read_sequence_rows(backend, field, source_row, target[output_row], target)
+                    else:
+                        destination = target[output_row : output_row + 1]
+                        result = backend.get(
+                            field["ref"], type="dataproto", batch_fields=[key], non_tensor_fields=[],
+                            meta_info_keys=[], data_cls=dict, rows=[source_row],
+                            destinations={key: tensor_destination(destination, alignment=alignment,
+                                                                  pre_registered=True, allocation=target)},
+                        )
+                        if result["batch"][key] is not destination:
+                            raise RuntimeError("Mooncake replaced the consumer destination")
+                continue
             start = 0
             while start < len(row_plan):
                 source_index = row_plan[start][0]

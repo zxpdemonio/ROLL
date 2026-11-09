@@ -375,6 +375,30 @@ class VllmStrategy(InferenceStrategy):
                 self.worker_config.attention_selection_max_bytes,
             )
 
+        # Enable GPU export only for artifacts whose schemas explicitly opt in.
+        transfer = getattr(self.worker.pipeline_config, "transfer_backend", None)
+        if transfer is not None and transfer.backend_name == "Mooncake":
+            from dataclasses import asdict
+            from roll.distributed.scheduler import transfer_backend
+
+            names = (["routed_experts"] if self.enable_rollout_routing_replay else [])
+            if self.attention_selection_profile is not None:
+                names.append(ATTENTION_SELECTION_KEY)
+            schemas = (transfer.backend_config or {}).get("field_schemas") or {}
+            direct = [key for key in names if schemas.get(key, {}).get("direct_alignment") is not None]
+            mode = ((transfer.backend_config or {}).get("transfer_policy") or {}).get("copy_mode", "auto")
+            if direct and mode == "auto":
+                if set(direct) != set(names):
+                    raise ValueError("vLLM GPU export requires direct schemas for every enabled artifact")
+                transfer_backend.init_client()
+                proxy = transfer_backend._client
+                ray.get(proxy.actor.ready.remote())
+                vllm_config["roll_mooncake_aux_output"] = {
+                    "backend_config": copy.deepcopy(proxy.config),
+                    "attention_profile": asdict(self.attention_selection_profile)
+                    if self.attention_selection_profile is not None else None,
+                }
+
         logger.info(f"vllm_config: {vllm_config}")
         assert not dist.is_initialized()
 
@@ -545,6 +569,20 @@ class VllmStrategy(InferenceStrategy):
         return output
 
     async def generate_request(self, payload: Dict):
+        try:
+            return await self._generate_request(payload)
+        except BaseException as error:
+            if getattr(self.model, "_roll_mooncake_aux_enabled", False):
+                from roll.distributed.scheduler.mooncake_direct import add_cleanup_note
+
+                try:
+                    await self.model.abort(request_id=payload["rid"])
+                    await self.model.settle_aux_outputs(request_ids=[payload["rid"]], discard=True)
+                except BaseException as cleanup_error:
+                    add_cleanup_note(error, cleanup_error)
+            raise
+
+    async def _generate_request(self, payload: Dict):
         if "multi_modal_data" in payload:
             prompt = build_tokens_prompt(payload["multi_modal_data"])
         else:
@@ -580,9 +618,38 @@ class VllmStrategy(InferenceStrategy):
             async for result in result_generator:
                 output = result
         except asyncio.CancelledError:
+            await self.model.abort(request_id=payload["rid"])
             if output is None:
+                if getattr(self.model, "_roll_mooncake_aux_enabled", False):
+                    await self.model.settle_aux_outputs(request_ids=[payload["rid"]], discard=True)
                 return {"finish_reasons": ["abort"]}
 
+        try:
+            return await self._finish_request_output(payload, output)
+        except BaseException as error:
+            from roll.distributed.scheduler.mooncake_direct import add_cleanup_note
+            from roll.distributed.scheduler.mooncake_sequence import rows_owner_batch
+
+            values = [getattr(completion, key, None) for completion in output.outputs
+                      for key in ("routed_experts", "indexer_topk")]
+            from roll.distributed.scheduler.mooncake_sequence import MooncakeRows
+
+            deliveries = {identity for value in values if isinstance(value, MooncakeRows)
+                          for identity in value.delivery_ids}
+            if deliveries:
+                try:
+                    await self.model.settle_aux_outputs(claims=list(deliveries), discard=True)
+                except BaseException as cleanup_error:
+                    add_cleanup_note(error, cleanup_error)
+            owner = rows_owner_batch(values, len(output.outputs))
+            if owner is not None:
+                try:
+                    owner.drop()
+                except Exception as cleanup_error:
+                    add_cleanup_note(error, cleanup_error)
+            raise
+
+    async def _finish_request_output(self, payload, output):
         output_token_ids, finish_reasons, logprobs = [], [], []
         routed_experts = []
         attention_selections = []
@@ -608,9 +675,12 @@ class VllmStrategy(InferenceStrategy):
             expected_rows = prompt_len + len(completion_output.token_ids) - 1
             re = getattr(completion_output, "routed_experts", None)
             if re is not None:
-                re = torch.as_tensor(re)
-                assert re.size(0) >= expected_rows, (
-                    f"routed_experts rows {re.size(0)} < expected {expected_rows} "
+                from roll.distributed.scheduler.mooncake_sequence import MooncakeRows
+
+                if not isinstance(re, MooncakeRows):
+                    re = torch.as_tensor(re)
+                assert len(re) >= expected_rows, (
+                    f"routed_experts rows {len(re)} < expected {expected_rows} "
                     f"(rid={payload.get('rid')}, prompt_len={prompt_len}, "
                     f"gen_len={len(completion_output.token_ids)}, finish_reason={finish_reason})"
                 )
@@ -629,13 +699,20 @@ class VllmStrategy(InferenceStrategy):
                         "attention_selection_profile is configured but vLLM returned no indexer_profile"
                     )
                 self.attention_selection_profile.validate_vllm_profile(producer_profile)
-                attention_selections.append(
-                    decode_attention_selection(
-                        raw_selection,
-                        self.attention_selection_profile,
-                        expected_rows=expected_rows,
+                from roll.distributed.scheduler.mooncake_sequence import MooncakeRows
+
+                if isinstance(raw_selection, MooncakeRows):
+                    if len(raw_selection) != expected_rows:
+                        raise ValueError("Remote selection does not cover the accepted token range")
+                    attention_selections.append(raw_selection)
+                else:
+                    attention_selections.append(
+                        decode_attention_selection(
+                            raw_selection,
+                            self.attention_selection_profile,
+                            expected_rows=expected_rows,
+                        )
                     )
-                )
 
         result = {
             "output_token_ids": output_token_ids,
@@ -657,11 +734,27 @@ class VllmStrategy(InferenceStrategy):
         if spec_metrics:
             result["metrics"] = spec_metrics
 
+        from roll.distributed.scheduler.mooncake_sequence import AUX_OWNER_KEY, MooncakeRows, rows_owner_batch
+
+        deliveries = {identity for rows in routed_experts + attention_selections
+                      if isinstance(rows, MooncakeRows) for identity in rows.delivery_ids}
+        owner = rows_owner_batch(routed_experts + attention_selections, len(output.outputs))
+        if owner is not None:
+            result[AUX_OWNER_KEY] = owner
+        if deliveries:
+            # One RPC cleans unclaimed siblings before transferring these refs.
+            # If its response is lost, _generate_request drops the local owner.
+            await self.model.settle_aux_outputs(claims=list(deliveries))
+        elif getattr(self.model, "_roll_mooncake_aux_enabled", False):
+            await self.model.settle_aux_outputs(request_ids=[payload["rid"]], discard=True)
+
         return result
 
     async def abort_requests(self, request_ids):
         for id in request_ids:
             await self.model.abort(request_id=id)
+        if getattr(self.model, "_roll_mooncake_aux_enabled", False):
+            await self.model.settle_aux_outputs(request_ids=list(request_ids), discard=True)
 
     # offload/reload 接口
     async def load_states(self, *args, **kwargs):

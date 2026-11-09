@@ -60,6 +60,7 @@ def response_filter(data_item, config):
     return True
 
 def postprocess_paused_data(pre_data, data: DataProto, sequence_length, prompt_length) -> DataProto:
+    from roll.distributed.scheduler.mooncake_sequence import MooncakeRows, merge_resumed_rows, rows_owner_batch
     if "output_token_ids" not in data.meta_info:  # abort without inferred a token
         # too many this log means need more infer workers
         logger.info(f"received data without output_token_ids")
@@ -79,14 +80,25 @@ def postprocess_paused_data(pre_data, data: DataProto, sequence_length, prompt_l
     new_batch = {**pre_data.batch}
 
     if "routed_experts" in data.meta_info:
-        cur_routed_experts = data.meta_info.pop("routed_experts")
+        cur_routed_experts = data.meta_info.get("routed_experts")
         pre_routed_experts = pre_data.meta_info.get("pre_routed_experts", None)
-        if pre_routed_experts is not None:
+        if isinstance(cur_routed_experts, list) and cur_routed_experts and isinstance(cur_routed_experts[0], MooncakeRows):
+            data.meta_info["pre_routed_experts"] = merge_resumed_rows(pre_routed_experts, cur_routed_experts)
+        elif pre_routed_experts is not None:
+            data.meta_info.pop("routed_experts")
             # 在序列维度拼接
             data.meta_info["pre_routed_experts"] = torch.cat([pre_routed_experts, cur_routed_experts], dim=0)
         else:
+            data.meta_info.pop("routed_experts")
             data.meta_info["pre_routed_experts"] = cur_routed_experts
-    new_batch["routed_experts"] = pre_data.batch.get("pre_routed_experts")
+    pre_rows = data.meta_info.get("pre_routed_experts")
+    if not (isinstance(pre_rows, list) and any(isinstance(value, MooncakeRows) for value in pre_rows)):
+        new_batch["routed_experts"] = pre_data.batch.get("pre_routed_experts")
+    selections = data.meta_info.get(ATTENTION_SELECTION_KEY)
+    if selections and isinstance(selections[0], MooncakeRows):
+        data.meta_info["pre_attention_selection"] = merge_resumed_rows(
+            pre_data.meta_info.get("pre_attention_selection"), selections,
+        )
 
     init_attention_mask = pre_data.batch.get("init_attention_mask", pre_data.batch["attention_mask"])
     new_batch["init_attention_mask"] = init_attention_mask
@@ -124,6 +136,12 @@ def postprocess_paused_data(pre_data, data: DataProto, sequence_length, prompt_l
     data = DataProto.from_dict(
         new_batch, non_tensors=new_non_tensor_batch, meta_info={**pre_data.meta_info, **data.meta_info}
     )
+    from roll.distributed.scheduler.mooncake_sequence import artifact_rows
+
+    values = artifact_rows(data.meta_info)
+    owner = rows_owner_batch(values, len(data))
+    if owner is not None:
+        data._remote_batch = owner
     assert data.batch["init_attention_mask"].shape[1] == prompt_length
     assert data.batch["init_input_ids"].shape[1] == prompt_length
     return data
@@ -201,9 +219,19 @@ class UserDefinedRolloutLoop:
             pre_routed_experts = request.meta_info.get("pre_routed_experts", None)
             if pre_routed_experts is not None:
                 # [B*S1, num_expert, topk] + [B*S2, num_expert, topk] -> [B*(S1+S2), num_expert, topk]
-                routed_experts = torch.cat([pre_routed_experts, routed_experts], dim=0)
+                from roll.distributed.scheduler.mooncake_sequence import MooncakeRows, merge_resumed_rows
+
+                if routed_experts and isinstance(routed_experts[0], MooncakeRows):
+                    routed_experts = merge_resumed_rows(pre_routed_experts, routed_experts)
+                else:
+                    routed_experts = torch.cat([pre_routed_experts, routed_experts], dim=0)
 
         attention_selection = data.meta_info.get(ATTENTION_SELECTION_KEY)
+        if attention_selection:
+            from roll.distributed.scheduler.mooncake_sequence import MooncakeRows, merge_resumed_rows
+
+            if isinstance(attention_selection[0], MooncakeRows):
+                attention_selection = merge_resumed_rows(request.meta_info.get("pre_attention_selection"), attention_selection)
         attention_selection_profile = data.meta_info.get(ATTENTION_SELECTION_PROFILE_KEY)
         attention_selection_profile_id = data.meta_info.get(EXECUTION_ARTIFACT_PROFILE_ID_KEY)
         if attention_selection is not None:
@@ -327,15 +355,30 @@ class UserDefinedRolloutLoop:
                     # only happened at shutdown, abort this prompt
                     return
                 elif is_report_data_finished(data):
-                    req = self.postprocess_output_data(req, data, context.sequence_length)
+                    try:
+                        req = self.postprocess_output_data(req, data, context.sequence_length)
+                    except BaseException as error:
+                        from roll.distributed.scheduler.mooncake_sequence import release_artifact_rows
+
+                        release_artifact_rows(data.meta_info, error=error)
+                        raise
                     break
                 else:
                     if not collect_unfinished:
                         logger.info(f"received unfinished response {context.prompt_id=}")
                         # return None to abort this prompt
+                        from roll.distributed.scheduler.mooncake_sequence import release_artifact_rows
+
+                        release_artifact_rows(data.meta_info)
                         return
                     else:
-                        req = postprocess_paused_data(req, data, context.sequence_length, context.prompt_length)
+                        try:
+                            req = postprocess_paused_data(req, data, context.sequence_length, context.prompt_length)
+                        except BaseException as error:
+                            from roll.distributed.scheduler.mooncake_sequence import release_artifact_rows
+
+                            release_artifact_rows(data.meta_info, error=error)
+                            raise
 
             with self.reward_transfer_ctx(req):
                 rewards = await context.compute_rewards(req=req, domain=domain)
@@ -360,6 +403,10 @@ class UserDefinedRolloutLoop:
                 break
             else:
                 # retry if filter out some responses
+                if response_filter_count == output_count:
+                    from roll.distributed.scheduler.mooncake_sequence import release_artifact_rows
+
+                    release_artifact_rows(data.meta_info)
                 original_req.meta_info["generation_config"]["num_return_sequences"] = response_filter_count
                 req = original_req
 

@@ -413,23 +413,7 @@ class MooncakeNodeClientProxy:
             # Actor construction is asynchronous. Wait before the first PUT so
             # the client-only process never races the node's segment setup.
             ray.get(self.actor.ready.remote())
-            config = dict(self.config)
-            config["global_segment_size"] = 0
-            if config.get("setup_args") is not None:
-                args = list(config["setup_args"])
-                if len(args) == 1 and isinstance(args[0], Mapping):
-                    args[0] = {**args[0], "global_segment_size": 0}
-                else:
-                    args[2] = 0
-                config["setup_args"] = args
-            elif config.get("setup_kwargs") is not None:
-                kwargs = dict(config["setup_kwargs"])
-                if "config" in kwargs:
-                    kwargs["config"] = {**kwargs["config"], "global_segment_size": 0}
-                else:
-                    kwargs["global_segment_size"] = 0
-                config["setup_kwargs"] = kwargs
-            self._direct_client = MooncakeClient(config)
+            self._direct_client = MooncakeClient(client_only_mooncake_config(self.config))
         return self._direct_client
 
     def delete(self, partition, keys: list[str], fields: list[Any]):
@@ -463,6 +447,27 @@ class MooncakeNodeClientProxy:
             num_cpus=0,
             scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node_id, soft=False),
         ).remote(self.config)
+
+
+def client_only_mooncake_config(config):
+    """Reuse node-owned storage from a process that never donates a segment."""
+    config = dict(config)
+    config["global_segment_size"] = 0
+    if config.get("setup_args") is not None:
+        args = list(config["setup_args"])
+        if len(args) == 1 and isinstance(args[0], Mapping):
+            args[0] = {**args[0], "global_segment_size": 0}
+        else:
+            args[2] = 0
+        config["setup_args"] = args
+    elif config.get("setup_kwargs") is not None:
+        kwargs = dict(config["setup_kwargs"])
+        if "config" in kwargs:
+            kwargs["config"] = {**kwargs["config"], "global_segment_size": 0}
+        else:
+            kwargs["global_segment_size"] = 0
+        config["setup_kwargs"] = kwargs
+    return config
 
 
 class MooncakeClient:
@@ -636,6 +641,7 @@ class MooncakeClient:
             raise RuntimeError("Mooncake has pending PUT cleanups") from first_error
 
     def delete(self, partition, keys: list[str], fields: list[Any]):
+        self._pending_put_cleanup_refs = getattr(self, "_pending_put_cleanup_refs", [])
         refs = []
         seen = set()
         for field in fields:
@@ -659,6 +665,8 @@ class MooncakeClient:
             try:
                 self.backend.cleanup_dataproto(ref)
             except Exception as exc:
+                if not any(self._ref_key(pending) == self._ref_key(ref) for pending in self._pending_put_cleanup_refs):
+                    self._pending_put_cleanup_refs.append(ref)
                 if first_error is None:
                     first_error = exc
         if first_error is not None:
